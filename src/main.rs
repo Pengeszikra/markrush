@@ -629,6 +629,8 @@ fn main() {
                 Key::Right => editor.move_right(),
                 Key::WheelUp => editor.scroll_up(3),
                 Key::WheelDown => editor.scroll_down(3),
+                Key::LittleG => editor.insert_char('g'),
+                Key::G => editor.insert_char('G'),
                 Key::Char(ch) if !ch.is_control() => editor.insert_char(ch),
                 _ => {}
             },
