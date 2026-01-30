@@ -1004,7 +1004,7 @@ fn main() {
                     Key::WheelDown => editor.scroll_down(3),
                     Key::G => {
                         editor.row = editor.buffer.len().saturating_sub(1);
-                        editor.col = 0;
+                        editor.col = editor.buffer[editor.row].len();
                     }
                     Key::LittleG => {
                         editor.pending_g = true;
