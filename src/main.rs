@@ -174,8 +174,7 @@ impl Editor {
             };
 
             if trimmed.starts_with("```") {
-                let color = if in_code { HEADER_COLOR } else { CODE_COLOR };
-                let rendered = render_with_selection(line, Some(color), selection_range);
+                let rendered = render_with_selection(line, Some(CODE_COLOR), selection_range);
                 println!("{rendered}{RESET}");
                 in_code = !in_code;
             } else if in_code {
