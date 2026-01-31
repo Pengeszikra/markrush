@@ -15,3 +15,16 @@ cargo run
 ## latest modification:
 visual mode, yank and paste working
 even for outside of this editor.
+
+```js
+const z = 2456;
+
+var doSomeFunction = (z) => console.log(z);
+
+const (p) => {
+  for (const m=2; m<20; m++){
+    // solve some cycle
+    doSomeFunction(m);   
+  }
+}
+```

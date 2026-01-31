@@ -1,3 +1,7 @@
+#[path = "highlight-core.rs"]
+mod highlight_core;
+
+use highlight_core::{Highlighter, TokenKind, REGISTRY};
 use std::{
     env,
     fs,
@@ -50,6 +54,7 @@ enum Key {
     WheelDown,
     G,
     LittleG,
+    Unknown,
 }
 
 #[derive(PartialEq)]
@@ -71,7 +76,7 @@ struct Editor {
     buffer: Vec<String>,
     row: usize,
     col: usize,
-    filename: String,
+    filename: Option<String>,
     clipboard: Option<String>,
     undo: Vec<Snapshot>,
     status: String,
@@ -84,19 +89,25 @@ struct Editor {
     selection_active: bool,
     sel_start_row: usize,
     sel_start_col: usize,
+    highlighter: Highlighter<'static>,
 }
 
 impl Editor {
-    fn open(path: &str, screen_rows: usize) -> Self {
-        let buffer = fs::read_to_string(path)
-            .map(|content| content.lines().map(|l| l.to_string()).collect())
-            .unwrap_or_else(|_| vec![String::new()]);
+    fn open(path: Option<&str>, screen_rows: usize) -> Self {
+        let (buffer, filename) = if let Some(path) = path {
+            let buf = fs::read_to_string(path)
+                .map(|content| content.lines().map(|l| l.to_string()).collect())
+                .unwrap_or_else(|_| vec![String::new()]);
+            (buf, Some(path.to_string()))
+        } else {
+            (vec![String::new()], None)
+        };
 
         Self {
             buffer,
             row: 0,
             col: 0,
-            filename: path.to_string(),
+            filename,
             clipboard: None,
             undo: Vec::new(),
             status: String::from("NORMAL"),
@@ -109,6 +120,7 @@ impl Editor {
             selection_active: false,
             sel_start_row: 0,
             sel_start_col: 0,
+            highlighter: Highlighter { registry: &REGISTRY },
         }
     }
 
@@ -140,53 +152,95 @@ impl Editor {
     fn render(&self) {
         print!("\x1b[2J\x1b[H"); // clear screen
 
-        // Determine starting code-block state up to scroll offset
-        let mut in_code = false;
-        for line in self.buffer.iter().take(self.scroll) {
-            if line.trim_start().starts_with("```") {
-                in_code = !in_code;
-            }
-        }
-
         let content_rows = self.screen_rows.saturating_sub(1);
+
+        let full_text = self.buffer.join("\n");
+        let line_starts = compute_line_starts(&self.buffer);
+        let selection_abs = self
+            .selection_bounds()
+            .map(|((sr, sc), (er, ec))| {
+                let start = line_starts
+                    .get(sr)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(sc);
+                let end = line_starts
+                    .get(er)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(ec);
+                (start, end)
+            });
+
+        let tokens = self.highlighter.highlight(&full_text);
+        let mut token_idx = 0usize;
+
         for idx in 0..content_rows {
             let line_idx = self.scroll + idx;
             if line_idx >= self.buffer.len() {
                 println!();
                 continue;
             }
-            let line = &self.buffer[line_idx];
-            let trimmed = line.trim_start();
-            let selection_range = if let Some(((sr, sc), (er, ec))) = self.selection_bounds() {
-                if line_idx < sr || line_idx > er {
-                    None
-                } else if sr == er {
-                    Some((sc, ec))
-                } else if line_idx == sr {
-                    Some((sc, line.len()))
-                } else if line_idx == er {
-                    Some((0, ec))
-                } else {
-                    Some((0, line.len()))
-                }
-            } else {
-                None
-            };
 
-            if trimmed.starts_with("```") {
-                let rendered = render_with_selection(line, Some(CODE_COLOR), selection_range);
-                println!("{rendered}{RESET}");
-                in_code = !in_code;
-            } else if in_code {
-                let rendered = render_with_selection(line, Some(CODE_COLOR), selection_range);
-                println!("{rendered}{RESET}");
-            } else if trimmed.starts_with('#') {
-                let rendered = render_with_selection(line, Some(HEADER_COLOR), selection_range);
-                println!("{rendered}{RESET}");
-            } else {
-                let rendered = render_with_selection(line, None, selection_range);
-                println!("{rendered}{RESET}");
+            let line_start = line_starts[line_idx];
+            let line_end = line_start + self.buffer[line_idx].len();
+
+            while token_idx < tokens.len() && tokens[token_idx].range.end <= line_start {
+                token_idx += 1;
             }
+
+            let mut line_out = String::new();
+            let mut pos = line_start;
+            let mut local_idx = token_idx;
+            while local_idx < tokens.len() {
+                let tok = &tokens[local_idx];
+                if tok.range.start >= line_end {
+                    break;
+                }
+
+                let seg_start = tok.range.start.max(line_start);
+                let seg_end = tok.range.end.min(line_end);
+
+                if pos < seg_start {
+                    line_out.push_str(&render_segment(
+                        &full_text,
+                        pos,
+                        seg_start,
+                        None,
+                        selection_abs,
+                    ));
+                }
+
+                line_out.push_str(&render_segment(
+                    &full_text,
+                    seg_start,
+                    seg_end,
+                    token_color(tok.kind),
+                    selection_abs,
+                ));
+
+                pos = seg_end;
+
+                if tok.range.end > line_end {
+                    break;
+                }
+                local_idx += 1;
+            }
+
+            if pos < line_end {
+                line_out.push_str(&render_segment(
+                    &full_text,
+                    pos,
+                    line_end,
+                    None,
+                    selection_abs,
+                ));
+            }
+
+            line_out.push_str(RESET);
+            print!("{line_out}\r\n");
+
+            token_idx = local_idx;
         }
 
         let mode_label = match self.mode {
@@ -249,9 +303,8 @@ impl Editor {
         if self.row >= self.buffer.len() {
             self.row = self.buffer.len().saturating_sub(1);
         }
-        let line_len = self.buffer.get(self.row).map(|l| l.len()).unwrap_or(0);
-        if self.col > line_len {
-            self.col = line_len;
+        if let Some(line) = self.buffer.get(self.row) {
+            self.col = clamp_char_boundary(line, self.col);
         }
         self.update_scroll();
     }
@@ -260,11 +313,9 @@ impl Editor {
         self.push_undo();
         self.dirty = true;
         let line = self.buffer.get_mut(self.row).unwrap();
-        if self.col > line.len() {
-            self.col = line.len();
-        }
+        self.col = clamp_char_boundary(line, self.col);
         line.insert(self.col, ch);
-        self.col += 1;
+        self.col = self.col.saturating_add(ch.len_utf8());
     }
 
     fn backspace(&mut self) {
@@ -277,8 +328,10 @@ impl Editor {
 
         if self.col > 0 {
             let line = self.buffer.get_mut(self.row).unwrap();
-            self.col -= 1;
-            line.remove(self.col);
+            self.col = clamp_char_boundary(line, self.col);
+            let prev = prev_char_boundary(line, self.col);
+            line.replace_range(prev..self.col, "");
+            self.col = prev;
         } else if self.row > 0 {
             let prev_len = self.buffer[self.row - 1].len();
             let current = self.buffer.remove(self.row);
@@ -293,6 +346,7 @@ impl Editor {
         self.push_undo();
         self.dirty = true;
         let current = self.buffer.get_mut(self.row).unwrap();
+        self.col = clamp_char_boundary(current, self.col);
         let right = current.split_off(self.col);
         self.row += 1;
         self.buffer.insert(self.row, right);
@@ -433,12 +487,24 @@ fn move_word_end(&mut self) {
         self.col = idx.min(line.len());
     }
 
-    fn save(&mut self) {
-        if fs::write(&self.filename, self.buffer.join("\n")).is_ok() {
-            self.dirty = false;
-            self.set_status("written");
-        } else {
-            self.set_status("write failed");
+    fn save(&mut self, path: Option<&str>) -> bool {
+        if let Some(p) = path {
+            self.filename = Some(p.to_string());
+        }
+        let Some(name) = &self.filename else {
+            self.set_status("No file name");
+            return false;
+        };
+        match fs::write(name, self.buffer.join("\n")) {
+            Ok(_) => {
+                self.dirty = false;
+                self.set_status("written");
+                true
+            }
+            Err(err) => {
+                self.set_status(format!("write failed: {err}"));
+                false
+            }
         }
     }
 
@@ -569,7 +635,8 @@ fn move_word_end(&mut self) {
 
     fn move_left(&mut self) {
         if self.col > 0 {
-            self.col -= 1;
+            let line = &self.buffer[self.row];
+            self.col = prev_char_boundary(line, self.col);
         } else if self.row > 0 {
             self.row -= 1;
             self.col = self.buffer[self.row].len();
@@ -580,7 +647,8 @@ fn move_word_end(&mut self) {
     fn move_right(&mut self) {
         let len = self.buffer[self.row].len();
         if self.col < len {
-            self.col += 1;
+            let line = &self.buffer[self.row];
+            self.col = next_char_boundary(line, self.col);
         } else if self.row + 1 < self.buffer.len() {
             self.row += 1;
             self.col = 0;
@@ -598,7 +666,7 @@ fn move_word_end(&mut self) {
                 }
                 self.row = 0;
                 self.col = 0;
-                self.filename = path.to_string();
+                self.filename = Some(path.to_string());
                 self.dirty = false;
                 self.set_status(format!("opened {path}"));
             }
@@ -701,6 +769,7 @@ fn read_key(stdin: &mut StdinLock) -> io::Result<Key> {
             }
             b'G' => Key::G,
             b'g' => Key::LittleG,
+            byte if byte >= 0x80 => Key::Unknown, // ignore non-ASCII input for stability
             _ => {
                 if let Some(ch) = char::from_u32(b as u32) {
                     Key::Char(ch)
@@ -749,34 +818,80 @@ fn color_links(line: &str, base_color: Option<&str>) -> String {
     out
 }
 
-fn render_with_selection(line: &str, base_color: Option<&str>, sel: Option<(usize, usize)>) -> String {
-    if sel.is_none() {
-        return color_links(line, base_color);
+fn compute_line_starts(lines: &[String]) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut offset = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        starts.push(offset);
+        offset += line.len();
+        if i + 1 < lines.len() {
+            offset += 1; // newline
+        }
+    }
+    starts
+}
+
+fn token_color(kind: TokenKind) -> Option<&'static str> {
+    match kind {
+        TokenKind::MdHeading => Some(HEADER_COLOR),
+        TokenKind::MdFence | TokenKind::MdCodeSpan => Some(CODE_COLOR),
+        TokenKind::MdEmph => Some("\u{1b}[35m"),
+        TokenKind::Keyword => Some("\u{1b}[1;34m"),
+        TokenKind::String => Some("\u{1b}[38;5;114m"),
+        TokenKind::Comment => Some("\u{1b}[38;5;244m"),
+        TokenKind::Number => Some("\u{1b}[1;33m"),
+        TokenKind::Tag | TokenKind::AttrName => Some("\u{1b}[1;35m"),
+        TokenKind::AttrValue => Some("\u{1b}[38;5;180m"),
+        TokenKind::Var => Some("\u{1b}[32m"),
+        TokenKind::Operator => Some("\u{1b}[1;37m"),
+        _ => None,
+    }
+}
+
+fn render_segment(
+    full_text: &str,
+    start: usize,
+    end: usize,
+    base_color: Option<&str>,
+    selection_abs: Option<(usize, usize)>,
+) -> String {
+    if start >= end || start >= full_text.len() {
+        return String::new();
     }
 
-    let (mut start, mut end) = sel.unwrap();
-    let len = line.len();
-    start = start.min(len);
-    end = end.min(len);
-    if start > end {
-        std::mem::swap(&mut start, &mut end);
+    let end = end.min(full_text.len());
+    if let Some((sel_start, sel_end)) = selection_abs {
+        if sel_end <= start || sel_start >= end {
+            let mut out = color_links(&full_text[start..end], base_color);
+            out.push_str(RESET);
+            return out;
+        }
+
+        let sel_s = sel_start.max(start);
+        let sel_e = sel_end.min(end);
+
+        let mut out = String::new();
+        if start < sel_s {
+            out.push_str(&color_links(&full_text[start..sel_s], base_color));
+            out.push_str(RESET);
+        }
+
+        out.push_str(SEL_BG);
+        if let Some(color) = base_color {
+            out.push_str(color);
+        }
+        out.push_str(&full_text[sel_s..sel_e]);
+        out.push_str(RESET);
+
+        if sel_e < end {
+            out.push_str(&color_links(&full_text[sel_e..end], base_color));
+            out.push_str(RESET);
+        }
+        return out;
     }
 
-    let pre = &line[..start];
-    let mid = &line[start..end];
-    let post = &line[end..];
-
-    let mut out = String::new();
-    out.push_str(&color_links(pre, base_color));
-
-    out.push_str(SEL_BG);
-    if let Some(color) = base_color {
-        out.push_str(color);
-    }
-    out.push_str(mid);
+    let mut out = color_links(&full_text[start..end], base_color);
     out.push_str(RESET);
-
-    out.push_str(&color_links(post, base_color));
     out
 }
 
@@ -818,12 +933,45 @@ fn read_system_clipboard() -> Option<String> {
     None
 }
 
+fn clamp_char_boundary(line: &str, col: usize) -> usize {
+    if col >= line.len() {
+        return line.len();
+    }
+    if line.is_char_boundary(col) {
+        col
+    } else {
+        let mut c = col;
+        while c > 0 && !line.is_char_boundary(c) {
+            c -= 1;
+        }
+        c
+    }
+}
+
+fn prev_char_boundary(line: &str, col: usize) -> usize {
+    if col == 0 {
+        return 0;
+    }
+    let mut c = col.saturating_sub(1).min(line.len());
+    while c > 0 && !line.is_char_boundary(c) {
+        c -= 1;
+    }
+    c
+}
+
+fn next_char_boundary(line: &str, col: usize) -> usize {
+    if col >= line.len() {
+        return line.len();
+    }
+    let mut c = col + 1;
+    while c < line.len() && !line.is_char_boundary(c) {
+        c += 1;
+    }
+    c.min(line.len())
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <markdown-file>", args[0]);
-        process::exit(1);
-    }
 
     let _raw = RawModeGuard::new().unwrap_or_else(|_| {
         eprintln!("Failed to enter raw mode");
@@ -841,7 +989,7 @@ fn main() {
         })
         .unwrap_or(24);
 
-    let mut editor = Editor::open(&args[1], term_rows);
+    let mut editor = Editor::open(args.get(1).map(|s| s.as_str()), term_rows);
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
 
@@ -869,6 +1017,7 @@ fn main() {
                 Key::LittleG => editor.insert_char('g'),
                 Key::G => editor.insert_char('G'),
                 Key::Char(ch) if !ch.is_control() => editor.insert_char(ch),
+                Key::Unknown => editor.set_status("Non-ASCII input not supported"),
                 _ => {}
             },
             Mode::Command => match key {
@@ -876,26 +1025,39 @@ fn main() {
                 Key::Enter => {
                     let cmd = editor.command.trim().to_string();
                     editor.enter_normal();
-                    if cmd == "q!" {
-                        break;
-                    } else if cmd == "q" {
-                        if editor.dirty {
-                            editor.set_status("Unsaved changes");
-                        } else {
-                            break;
+                    let mut parts = cmd.split_whitespace();
+                    let head = parts.next().unwrap_or("");
+                    let arg = parts.next();
+                    match head {
+                        "q!" => break,
+                        "q" => {
+                            if editor.dirty {
+                                editor.set_status("Unsaved changes");
+                            } else {
+                                break;
+                            }
                         }
-                    } else if cmd == "w" {
-                        editor.save();
-                    } else if cmd == "wq" {
-                        editor.save();
-                        break;
-                    } else if let Some(rest) = cmd.strip_prefix("e ") {
-                        let path = rest.trim();
-                        if !path.is_empty() {
-                            editor.open_file(path);
+                        "w" => {
+                            let path = arg.filter(|s| !s.is_empty());
+                            editor.save(path);
                         }
-                    } else {
-                        editor.set_status(format!("Unknown :{cmd}"));
+                        "wq" => {
+                            let path = arg.filter(|s| !s.is_empty());
+                            if editor.save(path) {
+                                break;
+                            } else {
+                                editor.set_status("No file name");
+                            }
+                        }
+                        "e" => {
+                            if let Some(p) = arg {
+                                editor.open_file(p);
+                            } else {
+                                editor.set_status("Missing file name");
+                            }
+                        }
+                        "" => {}
+                        _ => editor.set_status(format!("Unknown :{cmd}")),
                     }
                 }
                 Key::Backspace => {
@@ -905,6 +1067,7 @@ fn main() {
                 Key::End => {}
                 Key::Up | Key::Down | Key::Left | Key::Right | Key::WheelUp | Key::WheelDown => {}
                 Key::Char(ch) if !ch.is_control() => editor.command.push(ch),
+                Key::Unknown => {}
                 _ => {}
             },
             Mode::Normal => {
