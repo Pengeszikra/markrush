@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::highlight::span::Span;
 use crate::highlight::state::State;
 use crate::highlight::registry::Registry;
@@ -27,19 +29,20 @@ pub enum WorkItem {
 
 pub struct HighlighterEngine<'a> {
     pub registry: &'a Registry,
+    pub root_plugin: crate::highlight::state::PluginId,
     pub checkpoints: Vec<Checkpoint>,
     pub work_queue: Vec<WorkItem>,
 }
 
 impl<'a> HighlighterEngine<'a> {
-    pub fn new(registry: &'a Registry) -> Self {
-        Self { registry, checkpoints: Vec::new(), work_queue: Vec::new() }
+    pub fn new(registry: &'a Registry, root_plugin: crate::highlight::state::PluginId) -> Self {
+        Self { registry, root_plugin, checkpoints: Vec::new(), work_queue: Vec::new() }
     }
 
     pub fn highlight_window(&mut self, src: &str, window: WindowReq, budget_bytes: usize, budget_spans: usize) -> WindowResult {
         let (anchor_offset, anchor_state, exact) = match self.find_anchor(window.start) {
             Some((off, st)) => (off, st, true),
-            None => (0usize, State::new_default(), false),
+            None => (0usize, State::new_with_root(self.root_plugin), false),
         };
 
         let limit = window.end.min(src.len());
@@ -94,7 +97,7 @@ impl<'a> HighlighterEngine<'a> {
                 WorkItem::BuildCheckpointsForward { mut from_offset, to_offset, step_bytes } => {
                     let (anchor_offset, anchor_state) = match self.find_anchor(from_offset) {
                         Some((o, s)) => (o, s),
-                        None => (0usize, State::new_default()),
+                        None => (0usize, State::new_with_root(self.root_plugin)),
                     };
 
                     let mut stepper = Stepper::new(src, anchor_offset, anchor_state, self.registry);
@@ -150,4 +153,3 @@ impl<'a> HighlighterEngine<'a> {
         }
     }
 }
-

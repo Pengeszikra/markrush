@@ -1,5 +1,10 @@
 # markrush is a minimal CLI code editor
 
+```html
+<div>hello</div>
+<!-- bit interesting -->
+```
+
 This is a minimalist CLI code editor, 
 written in rust. Start as markdown editor
 with real time syntax highlithing.
@@ -7,7 +12,8 @@ with real time syntax highlithing.
 README.md also writen itself.
 
 ## test
-```
+```bash
+# remark in CLI
 cargo run
 ./target/debug/md-rush README.md
 ```
@@ -17,6 +23,7 @@ visual mode, yank and paste working
 even for outside of this editor.
 
 ```js
+//** @type{number} */
 const z = 2456;
 
 var doSomeFunction = (z) => console.log(z);

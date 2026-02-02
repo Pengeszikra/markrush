@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use core::ops::Range;
 
 #[repr(u8)]
@@ -33,4 +35,3 @@ pub struct Span {
     pub range: Range<usize>,
     pub style: StyleId,
 }
-

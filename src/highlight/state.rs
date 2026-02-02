@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluginId {
     Markdown,
@@ -30,8 +32,12 @@ pub struct State {
 
 impl State {
     pub fn new_default() -> Self {
+        Self::new_with_root(PluginId::Markdown)
+    }
+
+    pub fn new_with_root(root: PluginId) -> Self {
         let mut stack = SmallStack::new();
-        stack.push(PluginId::Markdown);
+        stack.push(root);
         Self {
             stack,
             prev: PrevClass::None,
@@ -56,6 +62,12 @@ impl<const N: usize> SmallStack<PluginId, N> {
     pub fn new() -> Self {
         let dummy = PluginId::Markdown;
         Self { buf: [dummy; N], len: 0, has_overflow: false }
+    }
+
+    pub fn reset_with(&mut self, root: PluginId) {
+        self.len = 0;
+        self.has_overflow = false;
+        self.push(root);
     }
 }
 
@@ -84,4 +96,3 @@ impl<T: Copy, const N: usize> SmallStack<T, N> {
     #[allow(dead_code)]
     pub fn has_overflowed(&self) -> bool { self.has_overflow }
 }
-

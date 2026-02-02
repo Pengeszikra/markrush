@@ -1,6 +1,8 @@
+#![allow(non_upper_case_globals)]
+
 use crate::highlight::span::{Span, StyleId};
-use crate::highlight::spec::{StepAction, PluginSpec};
-use crate::highlight::state::State;
+use crate::highlight::spec::StepAction;
+use crate::highlight::state::{PluginId, State};
 use crate::highlight::spec::language_plugin;
 
 fn is_line_start(src: &str, pos: usize) -> bool {
@@ -14,6 +16,26 @@ fn next_char_boundary(src: &str, pos: usize) -> Option<usize> {
 }
 
 pub fn scan_markdown_custom(src: &str, pos: usize, _state: &mut State) -> Option<(Span, StepAction)> {
+    if is_line_start(src, pos) && src[pos..].starts_with("```") {
+        let line_end = src[pos..].find('\n').map(|n| pos + n).unwrap_or(src.len());
+        let mut i = pos + 3;
+        while i < line_end && src.as_bytes()[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let lang_start = i;
+        while i < line_end && !src.as_bytes()[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let lang = if lang_start < i { &src[lang_start..i] } else { "" };
+        let target = match lang.to_ascii_lowercase().as_str() {
+            "js" | "javascript" => PluginId::Js,
+            "html" | "htm" => PluginId::HtmlText,
+            "bash" | "sh" | "" => PluginId::Bash,
+            _ => PluginId::Bash,
+        };
+        return Some((Span { range: pos..line_end, style: StyleId::MdFence }, StepAction::Push(target)));
+    }
+
     if is_line_start(src, pos) && src[pos..].starts_with('#') {
         let line_end = src[pos..].find('\n').map(|n| pos + n).unwrap_or(src.len());
         return Some((Span { range: pos..line_end, style: StyleId::MdHeading }, StepAction::None));
@@ -55,4 +77,3 @@ language_plugin! {
     entry_style: MdFence,
     scan_custom: Some(scan_markdown_custom)
 }
-

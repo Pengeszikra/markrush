@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::highlight::span::{Span, StyleId};
 use crate::highlight::state::{PluginId, State};
 
@@ -50,57 +52,5 @@ pub struct PluginSpec {
     pub entry_style: StyleId,
 }
 
-// Simple macro (not final DSL). Produces a const PluginSpec.
-macro_rules! language_plugin {
-    (
-        id: $id:ident,
-        name: $name:literal,
-        extensions: [$($ext:literal),* $(,)?],
-
-        keywords: [$($kw:literal),* $(,)?],
-
-        punct_low: [$($pl:literal),* $(,)?],
-        punct_mid: [$($pm:literal),* $(,)?],
-        operators: [$($op:literal),* $(,)?],
-
-        entry_rules: [$({ child: $child:ident, trigger: $trig:ident($trig_val:expr), guard: $guard:ident $(($guard_fn:expr))? }),* $(,)?],
-
-        entry_style: $entry_style:ident,
-        scan_custom: $scan_custom:expr
-    ) => {
-        pub const $id: PluginSpec = PluginSpec {
-            id: PluginId::$id,
-            name: $name,
-            extensions: &[$($ext),*],
-
-            keywords: &[$($kw),*],
-            punct_low: &[$($pl),*],
-            punct_mid: &[$($pm),*],
-            operators: &[$($op),*],
-
-            entry_rules: &[
-                $(
-                    EntryRule {
-                        child: PluginId::$child,
-                        trigger: Trigger::$trig($trig_val),
-                        guard: language_plugin!(@guard $guard $(($guard_fn))? ),
-                    }
-                ),*
-            ],
-
-            entry_rules_len: 0, // dummy to detect compile errors if macro drifted
-            scan_custom: $scan_custom,
-            entry_style: StyleId::$entry_style,
-        };
-    };
-
-    (@guard Always) => { Guard::Always };
-    (@guard AtLineStart) => { Guard::AtLineStart };
-    (@guard PrevIsExprStart) => { Guard::PrevIsExprStart };
-    (@guard Custom($f:expr)) => { Guard::Custom($f) };
-}
-
-// Workaround: Rust does not allow extra fields in macro above.
-// We keep PluginSpec stable and define specs in plugins/ files using a re-export macro.
-pub(crate) use language_plugin;
-
+// Macro defined in langue_plugin.rs for reuse.
+pub(crate) use crate::highlight::langue_plugin::language_plugin;

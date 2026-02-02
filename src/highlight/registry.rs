@@ -21,13 +21,12 @@ impl Registry {
     }
 }
 
-use crate::highlight::plugins::{BASH, HTML_TAG, HTML_TEXT, JS, MARKDOWN};
+use crate::highlight::plugins::{Bash, HtmlTag, HtmlText, Js, Markdown};
 
 pub const REGISTRY: Registry = Registry {
-    markdown: &MARKDOWN,
-    js: &JS,
-    html_text: &HTML_TEXT,
-    html_tag: &HTML_TAG,
-    bash: &BASH,
+    markdown: &Markdown,
+    js: &Js,
+    html_text: &HtmlText,
+    html_tag: &HtmlTag,
+    bash: &Bash,
 };
-

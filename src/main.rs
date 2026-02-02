@@ -1,12 +1,15 @@
 #[path = "highlight-core.rs"]
 mod highlight_core;
+mod highlight;
 
-use highlight_core::{Highlighter, TokenKind, REGISTRY};
+use highlight_core::{Highlighter as OldHighlighter, TokenKind, REGISTRY as OLD_REGISTRY};
+use crate::highlight::{HighlighterEngine, REGISTRY as NEW_REGISTRY, WindowReq, PluginId as NewPluginId, StyleId as NewStyleId, Span as NewSpan};
 use std::{
     env,
     fs,
     io::{self, Read, StdinLock, Write},
     process::{self, Command, Stdio},
+    path::Path,
 };
 
 const HEADER_COLOR: &str = "\u{1b}[1;36m"; // bright cyan for headings
@@ -89,7 +92,12 @@ struct Editor {
     selection_active: bool,
     sel_start_row: usize,
     sel_start_col: usize,
-    highlighter: Highlighter<'static>,
+    highlighter: OldHighlighter<'static>,
+    highlight_engine: HighlighterEngine<'static>,
+    use_new_highlighter: bool,
+    last_new_span_count: usize,
+    base_plugin: NewPluginId,
+    last_new_spans: Vec<NewSpan>,
 }
 
 impl Editor {
@@ -103,7 +111,9 @@ impl Editor {
             (vec![String::new()], None)
         };
 
-        Self {
+        let base_plugin = root_plugin_for_filename(filename.as_deref());
+
+        let mut editor = Self {
             buffer,
             row: 0,
             col: 0,
@@ -120,8 +130,23 @@ impl Editor {
             selection_active: false,
             sel_start_row: 0,
             sel_start_col: 0,
-            highlighter: Highlighter { registry: &REGISTRY },
+            highlighter: OldHighlighter { registry: &OLD_REGISTRY },
+            highlight_engine: HighlighterEngine::new(&NEW_REGISTRY, base_plugin),
+            use_new_highlighter: true,
+            last_new_span_count: 0,
+            base_plugin,
+            last_new_spans: Vec::new(),
+        };
+
+        if editor.use_new_highlighter {
+            let total_len = buffer_total_len(&editor.buffer);
+            editor.highlight_engine.checkpoints.clear();
+            editor
+                .highlight_engine
+                .schedule_checkpoint_build(0, total_len);
         }
+
+        editor
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -149,7 +174,7 @@ impl Editor {
         self.update_scroll();
     }
 
-    fn render(&self) {
+    fn render(&mut self) {
         print!("\x1b[2J\x1b[H"); // clear screen
 
         let content_rows = self.screen_rows.saturating_sub(1);
@@ -171,6 +196,10 @@ impl Editor {
                     .saturating_add(ec);
                 (start, end)
             });
+
+        if self.use_new_highlighter {
+            self.run_new_highlighter(&full_text, &line_starts, content_rows);
+        }
 
         let tokens = self.highlighter.highlight(&full_text);
         let mut token_idx = 0usize;
@@ -284,6 +313,35 @@ impl Editor {
             print!("\x1b[{};{}H", cursor_row, cursor_col);
         }
         let _ = io::stdout().flush();
+    }
+
+    fn run_new_highlighter(&mut self, full_text: &str, line_starts: &[usize], content_rows: usize) {
+        if !self.use_new_highlighter {
+            return;
+        }
+        if self.buffer.is_empty() {
+            self.last_new_span_count = 0;
+            return;
+        }
+
+        let start_line = self.scroll.min(self.buffer.len().saturating_sub(1));
+        let end_line = (self.scroll + content_rows.saturating_mul(3)).min(self.buffer.len().saturating_sub(1));
+
+        let window_start = *line_starts.get(start_line).unwrap_or(&0);
+        let window_end = if end_line + 1 < line_starts.len() {
+            line_starts[end_line + 1]
+        } else {
+            full_text.len()
+        };
+
+        let res = self.highlight_engine.highlight_window(
+            full_text,
+            WindowReq { start: window_start, end: window_end },
+            128 * 1024,
+            50_000,
+        );
+        self.last_new_span_count = res.spans.len();
+        self.highlight_engine.do_idle_work(full_text, 256 * 1024);
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -495,10 +553,17 @@ fn move_word_end(&mut self) {
             self.set_status("No file name");
             return false;
         };
+        self.base_plugin = root_plugin_for_filename(self.filename.as_deref());
         match fs::write(name, self.buffer.join("\n")) {
             Ok(_) => {
                 self.dirty = false;
                 self.set_status("written");
+                if self.use_new_highlighter {
+                    self.highlight_engine = HighlighterEngine::new(&NEW_REGISTRY, self.base_plugin);
+                    let total_len = buffer_total_len(&self.buffer);
+                    self.highlight_engine
+                        .schedule_checkpoint_build(0, total_len);
+                }
                 true
             }
             Err(err) => {
@@ -667,8 +732,16 @@ fn move_word_end(&mut self) {
                 self.row = 0;
                 self.col = 0;
                 self.filename = Some(path.to_string());
+                self.base_plugin = root_plugin_for_filename(self.filename.as_deref());
                 self.dirty = false;
                 self.set_status(format!("opened {path}"));
+                if self.use_new_highlighter {
+                    self.highlight_engine = HighlighterEngine::new(&NEW_REGISTRY, self.base_plugin);
+                    self.highlight_engine.checkpoints.clear();
+                    let total_len = buffer_total_len(&self.buffer);
+                    self.highlight_engine
+                        .schedule_checkpoint_build(0, total_len);
+                }
             }
             Err(err) => self.set_status(format!("open failed: {err}")),
         }
@@ -831,6 +904,20 @@ fn compute_line_starts(lines: &[String]) -> Vec<usize> {
     starts
 }
 
+fn buffer_total_len(lines: &[String]) -> usize {
+    if lines.is_empty() {
+        return 0;
+    }
+    let mut total = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        total += line.len();
+        if i + 1 < lines.len() {
+            total += 1; // newline
+        }
+    }
+    total
+}
+
 fn token_color(kind: TokenKind) -> Option<&'static str> {
     match kind {
         TokenKind::MdHeading => Some(HEADER_COLOR),
@@ -968,6 +1055,22 @@ fn next_char_boundary(line: &str, col: usize) -> usize {
         c += 1;
     }
     c.min(line.len())
+}
+
+fn root_plugin_for_filename(name: Option<&str>) -> NewPluginId {
+    if let Some(name) = name {
+        if let Some(ext) = Path::new(name).extension().and_then(|s| s.to_str()) {
+            let lower = ext.to_ascii_lowercase();
+            return match lower.as_str() {
+                "md" | "markdown" => NewPluginId::Markdown,
+                "sh" | "bash" => NewPluginId::Bash,
+                "js" | "mjs" | "cjs" => NewPluginId::Js,
+                "html" | "htm" => NewPluginId::HtmlText,
+                _ => NewPluginId::Markdown,
+            };
+        }
+    }
+    NewPluginId::Markdown
 }
 
 fn main() {
