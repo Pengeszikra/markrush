@@ -1,7 +1,6 @@
 /target
 /target/
 /.vscode/
-**/*.rs.bk
 *.swp
 *.swo
 /.cargo/
