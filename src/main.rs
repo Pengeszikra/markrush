@@ -3,7 +3,7 @@ mod highlight_core;
 mod highlight;
 
 use highlight_core::{Highlighter as OldHighlighter, TokenKind, REGISTRY as OLD_REGISTRY};
-use crate::highlight::{HighlighterEngine, REGISTRY as NEW_REGISTRY, WindowReq, PluginId as NewPluginId, StyleId as NewStyleId, Span as NewSpan};
+use crate::highlight::{HighlighterEngine, REGISTRY as NEW_REGISTRY, WindowReq, PluginId as NewPluginId, Span as NewSpan};
 use std::{
     env,
     fs,
@@ -96,7 +96,9 @@ struct Editor {
     highlight_engine: HighlighterEngine<'static>,
     use_new_highlighter: bool,
     last_new_span_count: usize,
+    #[allow(dead_code)]
     base_plugin: NewPluginId,
+    #[allow(dead_code)]
     last_new_spans: Vec<NewSpan>,
 }
 

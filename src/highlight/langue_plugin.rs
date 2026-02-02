@@ -56,3 +56,65 @@ macro_rules! language_plugin {
 }
 
 pub(crate) use language_plugin;
+
+#[cfg(test)]
+mod tests {
+    #![allow(non_upper_case_globals)]
+    use super::*;
+    use crate::highlight::span::{Span, StyleId};
+    use crate::highlight::spec::{Guard, StepAction, Trigger};
+    use crate::highlight::state::{PluginId, State};
+
+    fn dummy_scan(_src: &str, _pos: usize, _state: &mut State) -> Option<(Span, StepAction)> {
+        None
+    }
+
+    language_plugin! {
+        id: Markdown,
+        name: "tmd-test",
+        extensions: ["tmd"],
+
+        keywords: ["if"],
+
+        punct_low: [","],
+        punct_mid: ["("],
+        operators: ["+","-"],
+
+        entry_rules: [
+            { child: Js, trigger: Prefix("```js"), guard: AtLineStart },
+        ],
+
+        entry_style: MdFence,
+        scan_custom: Some(dummy_scan)
+    }
+
+    language_plugin! {
+        id: Js,
+        name: "tjs-test",
+        extensions: ["tjs","js"],
+
+        keywords: ["const"],
+
+        punct_low: [","],
+        punct_mid: ["("],
+        operators: ["+"],
+
+        entry_rules: [],
+
+        entry_style: Operator,
+        scan_custom: None
+    }
+
+    #[test]
+    fn builds_specs() {
+        assert_eq!(Markdown.name, "tmd-test");
+        assert_eq!(Markdown.extensions.len(), 1);
+        assert_eq!(Js.extensions.len(), 2);
+        assert_eq!(Markdown.entry_rules.len(), 1);
+        match Markdown.entry_rules[0].trigger {
+            Trigger::Prefix(pat) => assert_eq!(pat, "```js"),
+            _ => panic!("wrong trigger"),
+        }
+        assert_eq!(Markdown.entry_style as u8, StyleId::MdFence as u8);
+    }
+}
