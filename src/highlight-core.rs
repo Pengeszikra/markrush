@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Minimal, dependency-free, view-independent syntax highlighting core
 //! with a tiny macro DSL to define languages.
 //!

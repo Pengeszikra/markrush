@@ -95,6 +95,10 @@ pub fn color_links(line: &str, base_color: Option<&str>) -> String {
     let mut out = String::new();
     let mut idx = 0usize;
 
+    if let Some(color) = base_color {
+        out.push_str(color);
+    }
+
     while idx < bytes.len() {
         let rel_start = match line[idx..].find('[') {
             Some(v) => v,
@@ -206,4 +210,3 @@ pub fn render_content_lines(
         span_idx = local_idx;
     }
 }
-

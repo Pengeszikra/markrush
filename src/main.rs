@@ -11,9 +11,9 @@ use std::{
     io::{self, Read, StdinLock, Write},
     process::{self, Command, Stdio},
     path::Path,
+    str,
 };
 
-const SEL_BG: &str = "\u{1b}[48;5;238m"; // dark grey selection background
 const RESET: &str = "\u{1b}[0m";
 
 struct RawModeGuard;
@@ -126,7 +126,10 @@ impl Editor {
             (vec![String::new()], None)
         };
 
-        let base_plugin = NewPluginId::Markdown;
+        let base_plugin = filename
+            .as_deref()
+            .map(select_plugin_for_path)
+            .unwrap_or(NewPluginId::Markdown);
 
         Self {
             buffer,
@@ -518,18 +521,35 @@ fn compute_line_starts(lines: &[String]) -> Vec<usize> {
     starts
 }
 
-fn buffer_total_len(lines: &[String]) -> usize {
-    if lines.is_empty() {
-        return 0;
+fn clamp_row(row: usize, buffer: &[String]) -> usize {
+    if buffer.is_empty() {
+        0
+    } else {
+        row.min(buffer.len().saturating_sub(1))
     }
-    let mut total = 0usize;
-    for (i, line) in lines.iter().enumerate() {
-        total += line.len();
-        if i + 1 < lines.len() {
-            total += 1; // newline
-        }
+}
+
+fn max_scroll(buffer_len: usize, screen_rows: usize) -> usize {
+    let content_rows = screen_rows.saturating_sub(1);
+    if content_rows == 0 {
+        0
+    } else {
+        buffer_len.saturating_sub(content_rows)
     }
-    total
+}
+
+fn select_plugin_for_path(path: &str) -> NewPluginId {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    match ext.as_deref() {
+        Some("js") | Some("mjs") | Some("cjs") => NewPluginId::Js,
+        Some("html") | Some("htm") => NewPluginId::HtmlText,
+        Some("sh") | Some("bash") => NewPluginId::Bash,
+        _ => NewPluginId::Markdown,
+    }
 }
 
 fn read_key(stdin: &mut StdinLock<'_>) -> Key {
@@ -551,6 +571,34 @@ fn read_key(stdin: &mut StdinLock<'_>) -> Key {
                 b'D' => return Key::Left,
                 b'H' => return Key::Home,
                 b'F' => return Key::End,
+                b'<' => {
+                    // SGR mouse (enabled via 1006h). Keep reading until the final M/m.
+                    let mut seq = Vec::from(&buf[..n]);
+                    while !seq.ends_with(b"M") && !seq.ends_with(b"m") {
+                        let mut tmp = [0u8; 16];
+                        match stdin.read(&mut tmp) {
+                            Ok(0) | Err(_) => break,
+                            Ok(m) => seq.extend_from_slice(&tmp[..m]),
+                        }
+                        if seq.len() > 32 {
+                            break; // avoid runaway on malformed data
+                        }
+                    }
+                    if seq.len() >= 6 {
+                        if let Ok(body) = str::from_utf8(&seq[3..seq.len().saturating_sub(1)]) {
+                            let mut parts = body.split(';');
+                            if let (Some(btn), Some(_x), Some(_y)) = (parts.next(), parts.next(), parts.next()) {
+                                if let Ok(code) = btn.parse::<u8>() {
+                                    return match code {
+                                        64 => Key::WheelUp,
+                                        65 => Key::WheelDown,
+                                        _ => Key::Unknown,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
                 b'M' => {
                     if n >= 6 {
                         let button = buf[3];
@@ -674,12 +722,26 @@ fn main() {
                         editor.pending_g = false;
                     }
                     Key::WheelUp => {
-                        editor.scroll = editor.scroll.saturating_sub(3);
+                        if !editor.buffer.is_empty() {
+                            editor.row = clamp_row(editor.row.saturating_sub(3), &editor.buffer);
+                            editor.col = editor.col.min(editor.buffer[editor.row].len());
+                        }
+                        let max_scroll = max_scroll(editor.buffer.len(), editor.screen_rows);
+                        editor.scroll = editor.scroll.saturating_sub(3).min(max_scroll);
+                        if editor.scroll > max_scroll {
+                            editor.scroll = max_scroll;
+                        }
                     }
                     Key::WheelDown => {
-                        let total = buffer_total_len(&editor.buffer);
-                        if total > 0 {
-                            editor.scroll = (editor.scroll + 3).min(editor.buffer.len().saturating_sub(1));
+                        let content_rows = editor.screen_rows.saturating_sub(1);
+                        if !editor.buffer.is_empty() {
+                            let max_row = editor.buffer.len().saturating_sub(1);
+                            editor.row = clamp_row((editor.row + 3).min(max_row), &editor.buffer);
+                            editor.col = editor.col.min(editor.buffer[editor.row].len());
+                        }
+                        let max_scroll = max_scroll(editor.buffer.len(), editor.screen_rows);
+                        if content_rows > 0 {
+                            editor.scroll = (editor.scroll + 3).min(max_scroll);
                         }
                     }
                     Key::Esc => {
@@ -742,4 +804,3 @@ fn main() {
     print!("{RESET}");
     let _ = io::stdout().flush();
 }
-
