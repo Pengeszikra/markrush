@@ -649,11 +649,21 @@ fn main() {
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
 
+    let mut needs_render = true;
+
     loop {
-        editor.ensure_cursor_visible();
-        editor.render();
+        if needs_render {
+            editor.ensure_cursor_visible();
+            editor.render();
+            needs_render = false;
+        }
 
         let key = read_key(&mut stdin);
+        if matches!(key, Key::Unknown) {
+            continue;
+        }
+        needs_render = true;
+
         match editor.mode {
             Mode::Normal => {
                 match key {
@@ -788,6 +798,7 @@ fn main() {
                             let _ = io::stdout().flush();
                             break;
                         }
+                        needs_render = true;
                     }
                     Key::Backspace => {
                         editor.command.pop();
