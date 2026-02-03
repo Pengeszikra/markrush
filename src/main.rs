@@ -177,6 +177,7 @@ impl Editor {
     }
 
     fn render(&mut self) {
+        self.refresh_terminal_rows();
         print!("\x1b[2J\x1b[H"); // clear screen
 
         let content_rows = self.screen_rows.saturating_sub(1);
@@ -315,6 +316,31 @@ impl Editor {
             print!("\x1b[{};{}H", cursor_row, cursor_col);
         }
         let _ = io::stdout().flush();
+    }
+
+    fn refresh_terminal_rows(&mut self) {
+        let mut rows_opt = None;
+
+        if let Ok(out) = Command::new("stty").arg("size").output() {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                rows_opt = s
+                    .split_whitespace()
+                    .next()
+                    .and_then(|p| p.parse::<usize>().ok());
+            }
+        }
+
+        if rows_opt.is_none() {
+            rows_opt = std::env::var("LINES").ok().and_then(|v| v.parse::<usize>().ok());
+        }
+
+        if let Some(rows) = rows_opt {
+            let new_rows = rows.max(3);
+            if new_rows != self.screen_rows {
+                self.screen_rows = new_rows;
+                self.update_scroll();
+            }
+        }
     }
 
     fn run_new_highlighter(&mut self, full_text: &str, line_starts: &[usize], content_rows: usize) {
