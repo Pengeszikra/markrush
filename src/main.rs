@@ -1,8 +1,9 @@
 #[path = "highlight-core.rs"]
 mod highlight_core;
 mod highlight;
+mod ui;
 
-use highlight_core::{Highlighter as OldHighlighter, TokenKind, REGISTRY as OLD_REGISTRY};
+use highlight_core::{Highlighter as OldHighlighter, REGISTRY as OLD_REGISTRY};
 use crate::highlight::{HighlighterEngine, REGISTRY as NEW_REGISTRY, WindowReq, PluginId as NewPluginId, Span as NewSpan};
 use std::{
     env,
@@ -12,9 +13,6 @@ use std::{
     path::Path,
 };
 
-const HEADER_COLOR: &str = "\u{1b}[1;36m"; // bright cyan for headings
-const CODE_COLOR: &str = "\u{1b}[38;5;70m"; // soft green for code blocks
-const LINK_COLOR: &str = "\u{1b}[1;34m"; // bright blue for links
 const SEL_BG: &str = "\u{1b}[48;5;238m"; // dark grey selection background
 const RESET: &str = "\u{1b}[0m";
 
@@ -92,88 +90,148 @@ struct Editor {
     selection_active: bool,
     sel_start_row: usize,
     sel_start_col: usize,
+
+    // Keep old highlighter around for debugging/regression, but do not render it now.
+    #[allow(dead_code)]
     highlighter: OldHighlighter<'static>,
+
     highlight_engine: HighlighterEngine<'static>,
     use_new_highlighter: bool,
     last_new_span_count: usize,
+
     #[allow(dead_code)]
     base_plugin: NewPluginId,
-    #[allow(dead_code)]
+
     last_new_spans: Vec<NewSpan>,
 }
 
 impl Editor {
     fn open(path: Option<&str>, screen_rows: usize) -> Self {
         let (buffer, filename) = if let Some(path) = path {
-            let buf = fs::read_to_string(path)
-                .map(|content| content.lines().map(|l| l.to_string()).collect())
-                .unwrap_or_else(|_| vec![String::new()]);
+            let buf = if Path::new(path).exists() {
+                let content = fs::read_to_string(path).unwrap_or_default();
+                let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+                if content.ends_with('\n') {
+                    lines.push(String::new());
+                }
+                if lines.is_empty() {
+                    lines.push(String::new());
+                }
+                lines
+            } else {
+                vec![String::new()]
+            };
             (buf, Some(path.to_string()))
         } else {
             (vec![String::new()], None)
         };
 
-        let base_plugin = root_plugin_for_filename(filename.as_deref());
+        let base_plugin = NewPluginId::Markdown;
 
-        let mut editor = Self {
+        Self {
             buffer,
             row: 0,
             col: 0,
             filename,
             clipboard: None,
             undo: Vec::new(),
-            status: String::from("NORMAL"),
+            status: String::new(),
             mode: Mode::Normal,
             dirty: false,
             command: String::new(),
             pending_g: false,
             scroll: 0,
-            screen_rows: screen_rows.max(3),
+            screen_rows,
             selection_active: false,
             sel_start_row: 0,
             sel_start_col: 0,
+
             highlighter: OldHighlighter { registry: &OLD_REGISTRY },
+
             highlight_engine: HighlighterEngine::new(&NEW_REGISTRY, base_plugin),
             use_new_highlighter: true,
             last_new_span_count: 0,
             base_plugin,
             last_new_spans: Vec::new(),
+        }
+    }
+
+    fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        if !self.selection_active {
+            return None;
+        }
+
+        let (a_r, a_c) = (self.sel_start_row, self.sel_start_col);
+        let (b_r, b_c) = (self.row, self.col);
+
+        if (b_r, b_c) < (a_r, a_c) {
+            Some(((b_r, b_c), (a_r, a_c)))
+        } else {
+            Some(((a_r, a_c), (b_r, b_c)))
+        }
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        let content_rows = self.screen_rows.saturating_sub(1);
+        if self.row < self.scroll {
+            self.scroll = self.row;
+        } else if self.row >= self.scroll + content_rows {
+            self.scroll = self.row.saturating_sub(content_rows.saturating_sub(1));
+        }
+    }
+
+    fn refresh_terminal_rows(&mut self) {
+        let mut rows_opt = None;
+
+        if let Ok(out) = Command::new("stty").arg("size").output() {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                rows_opt = s
+                    .split_whitespace()
+                    .next()
+                    .and_then(|p| p.parse::<usize>().ok());
+            }
+        }
+
+        if let Some(r) = rows_opt {
+            self.screen_rows = r.max(3);
+        } else {
+            self.screen_rows = 24;
+        }
+    }
+
+    fn run_new_highlighter(&mut self, full_text: &str, line_starts: &[usize], content_rows: usize) {
+        if !self.use_new_highlighter {
+            return;
+        }
+        if self.buffer.is_empty() {
+            self.last_new_span_count = 0;
+            self.last_new_spans.clear();
+            return;
+        }
+
+        let start_line = self.scroll.min(self.buffer.len().saturating_sub(1));
+        let end_line = (self.scroll + content_rows.saturating_mul(3)).min(self.buffer.len().saturating_sub(1));
+
+        let window_start = *line_starts.get(start_line).unwrap_or(&0);
+        let window_end = if end_line + 1 < line_starts.len() {
+            line_starts[end_line + 1]
+        } else {
+            full_text.len()
         };
 
-        if editor.use_new_highlighter {
-            let total_len = buffer_total_len(&editor.buffer);
-            editor.highlight_engine.checkpoints.clear();
-            editor
-                .highlight_engine
-                .schedule_checkpoint_build(0, total_len);
-        }
+        let res = self.highlight_engine.highlight_window(
+            full_text,
+            WindowReq { start: window_start, end: window_end },
+            128 * 1024,
+            50_000,
+        );
 
-        editor
-    }
+        self.last_new_span_count = res.spans.len();
+        self.last_new_spans = res.spans;
 
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            buffer: self.buffer.clone(),
-            row: self.row,
-            col: self.col.min(self.buffer.get(self.row).map(|l| l.len()).unwrap_or(0)),
-            dirty: self.dirty,
-        }
-    }
-
-    fn push_undo(&mut self) {
-        self.undo.push(self.snapshot());
-        if self.undo.len() > 200 {
-            self.undo.remove(0);
-        }
-    }
-
-    fn restore(&mut self, snap: Snapshot) {
-        self.buffer = snap.buffer;
-        self.row = snap.row.min(self.buffer.len().saturating_sub(1));
-        self.col = snap.col.min(self.buffer[self.row].len());
-        self.dirty = snap.dirty;
-        self.status = String::from("undone");
-        self.update_scroll();
+        // Intentionally disabled in this refactor pass:
+        // keep highlight correctness development isolated from background work scheduling.
+        // self.highlight_engine.do_idle_work(full_text, 256 * 1024);
     }
 
     fn render(&mut self) {
@@ -184,96 +242,31 @@ impl Editor {
 
         let full_text = self.buffer.join("\n");
         let line_starts = compute_line_starts(&self.buffer);
+
         let selection_abs = self
             .selection_bounds()
             .map(|((sr, sc), (er, ec))| {
-                let start = line_starts
-                    .get(sr)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(sc);
-                let end = line_starts
-                    .get(er)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(ec);
+                let start = line_starts.get(sr).copied().unwrap_or(0).saturating_add(sc);
+                let end = line_starts.get(er).copied().unwrap_or(0).saturating_add(ec);
                 (start, end)
             });
 
         if self.use_new_highlighter {
             self.run_new_highlighter(&full_text, &line_starts, content_rows);
+        } else {
+            self.last_new_span_count = 0;
+            self.last_new_spans.clear();
         }
 
-        let tokens = self.highlighter.highlight(&full_text);
-        let mut token_idx = 0usize;
-
-        for idx in 0..content_rows {
-            let line_idx = self.scroll + idx;
-            if line_idx >= self.buffer.len() {
-                println!();
-                continue;
-            }
-
-            let line_start = line_starts[line_idx];
-            let line_end = line_start + self.buffer[line_idx].len();
-
-            while token_idx < tokens.len() && tokens[token_idx].range.end <= line_start {
-                token_idx += 1;
-            }
-
-            let mut line_out = String::new();
-            let mut pos = line_start;
-            let mut local_idx = token_idx;
-            while local_idx < tokens.len() {
-                let tok = &tokens[local_idx];
-                if tok.range.start >= line_end {
-                    break;
-                }
-
-                let seg_start = tok.range.start.max(line_start);
-                let seg_end = tok.range.end.min(line_end);
-
-                if pos < seg_start {
-                    line_out.push_str(&render_segment(
-                        &full_text,
-                        pos,
-                        seg_start,
-                        None,
-                        selection_abs,
-                    ));
-                }
-
-                line_out.push_str(&render_segment(
-                    &full_text,
-                    seg_start,
-                    seg_end,
-                    token_color(tok.kind),
-                    selection_abs,
-                ));
-
-                pos = seg_end;
-
-                if tok.range.end > line_end {
-                    break;
-                }
-                local_idx += 1;
-            }
-
-            if pos < line_end {
-                line_out.push_str(&render_segment(
-                    &full_text,
-                    pos,
-                    line_end,
-                    None,
-                    selection_abs,
-                ));
-            }
-
-            line_out.push_str(RESET);
-            print!("{line_out}\r\n");
-
-            token_idx = local_idx;
-        }
+        ui::render::render_content_lines(
+            &full_text,
+            &self.buffer,
+            &line_starts,
+            self.scroll,
+            content_rows,
+            &self.last_new_spans,
+            selection_abs,
+        );
 
         let mode_label = match self.mode {
             Mode::Normal => {
@@ -294,11 +287,12 @@ impl Editor {
         };
 
         println!(
-            "\x1b[7m{} | {} | line {} col {}{}\x1b[0m",
+            "\x1b[7m{} | {} | line {} col {} | spans {}{}\x1b[0m",
             mode_label,
             status_text,
             self.row + 1,
             self.col + 1,
+            self.last_new_span_count,
             if self.dirty { " [+]" } else { "" }
         );
 
@@ -315,608 +309,200 @@ impl Editor {
             let cursor_col = self.col + 1;
             print!("\x1b[{};{}H", cursor_row, cursor_col);
         }
+
         let _ = io::stdout().flush();
     }
 
-    fn refresh_terminal_rows(&mut self) {
-        let mut rows_opt = None;
-
-        if let Ok(out) = Command::new("stty").arg("size").output() {
-            if let Ok(s) = String::from_utf8(out.stdout) {
-                rows_opt = s
-                    .split_whitespace()
-                    .next()
-                    .and_then(|p| p.parse::<usize>().ok());
-            }
-        }
-
-        if rows_opt.is_none() {
-            rows_opt = std::env::var("LINES").ok().and_then(|v| v.parse::<usize>().ok());
-        }
-
-        if let Some(rows) = rows_opt {
-            let new_rows = rows.max(3);
-            if new_rows != self.screen_rows {
-                self.screen_rows = new_rows;
-                self.update_scroll();
-            }
-        }
-    }
-
-    fn run_new_highlighter(&mut self, full_text: &str, line_starts: &[usize], content_rows: usize) {
-        if !self.use_new_highlighter {
-            return;
-        }
-        if self.buffer.is_empty() {
-            self.last_new_span_count = 0;
-            return;
-        }
-
-        let start_line = self.scroll.min(self.buffer.len().saturating_sub(1));
-        let end_line = (self.scroll + content_rows.saturating_mul(3)).min(self.buffer.len().saturating_sub(1));
-
-        let window_start = *line_starts.get(start_line).unwrap_or(&0);
-        let window_end = if end_line + 1 < line_starts.len() {
-            line_starts[end_line + 1]
-        } else {
-            full_text.len()
-        };
-
-        let res = self.highlight_engine.highlight_window(
-            full_text,
-            WindowReq { start: window_start, end: window_end },
-            128 * 1024,
-            50_000,
-        );
-        self.last_new_span_count = res.spans.len();
-        self.highlight_engine.do_idle_work(full_text, 256 * 1024);
-    }
-
-    fn set_status(&mut self, msg: impl Into<String>) {
-        self.status = msg.into();
-    }
-
-    fn update_scroll(&mut self) {
-        let content_rows = self.screen_rows.saturating_sub(1);
-        if self.row < self.scroll {
-            self.scroll = self.row;
-        } else if self.row >= self.scroll + content_rows {
-            self.scroll = self.row.saturating_sub(content_rows - 1);
-        }
-    }
-
-    fn ensure_cursor(&mut self) {
+    fn insert_char(&mut self, c: char) {
         if self.row >= self.buffer.len() {
-            self.row = self.buffer.len().saturating_sub(1);
+            self.buffer.push(String::new());
         }
-        if let Some(line) = self.buffer.get(self.row) {
-            self.col = clamp_char_boundary(line, self.col);
-        }
-        self.update_scroll();
+        let line = &mut self.buffer[self.row];
+        let insert_at = self.col.min(line.len());
+        line.insert(insert_at, c);
+        self.col += c.len_utf8();
+        self.dirty = true;
     }
 
-    fn insert_char(&mut self, ch: char) {
-        self.push_undo();
+    fn insert_newline(&mut self) {
+        if self.row >= self.buffer.len() {
+            self.buffer.push(String::new());
+            self.row = self.buffer.len() - 1;
+            self.col = 0;
+            self.dirty = true;
+            return;
+        }
+
+        let line = &mut self.buffer[self.row];
+        let split_at = self.col.min(line.len());
+        let new_line = line[split_at..].to_string();
+        line.truncate(split_at);
+        self.buffer.insert(self.row + 1, new_line);
+
+        self.row += 1;
+        self.col = 0;
         self.dirty = true;
-        let line = self.buffer.get_mut(self.row).unwrap();
-        self.col = clamp_char_boundary(line, self.col);
-        line.insert(self.col, ch);
-        self.col = self.col.saturating_add(ch.len_utf8());
     }
 
     fn backspace(&mut self) {
-        if self.row == 0 && self.col == 0 {
+        if self.row >= self.buffer.len() {
             return;
         }
-
-        self.push_undo();
-        self.dirty = true;
 
         if self.col > 0 {
-            let line = self.buffer.get_mut(self.row).unwrap();
-            self.col = clamp_char_boundary(line, self.col);
-            let prev = prev_char_boundary(line, self.col);
-            line.replace_range(prev..self.col, "");
-            self.col = prev;
-        } else if self.row > 0 {
-            let prev_len = self.buffer[self.row - 1].len();
-            let current = self.buffer.remove(self.row);
-            self.row -= 1;
-            self.col = prev_len;
-            self.buffer[self.row].push_str(&current);
-        }
-        self.ensure_cursor();
-    }
-
-    fn new_line(&mut self) {
-        self.push_undo();
-        self.dirty = true;
-        let current = self.buffer.get_mut(self.row).unwrap();
-        self.col = clamp_char_boundary(current, self.col);
-        let right = current.split_off(self.col);
-        self.row += 1;
-        self.buffer.insert(self.row, right);
-        self.col = 0;
-    }
-
-    fn enter_insert(&mut self) {
-        self.mode = Mode::Insert;
-        self.pending_g = false;
-        self.selection_active = false;
-        self.set_status("INSERT");
-    }
-
-    fn enter_normal(&mut self) {
-        self.mode = Mode::Normal;
-        self.command.clear();
-        self.pending_g = false;
-        self.selection_active = false;
-        self.set_status("NORMAL");
-        self.ensure_cursor();
-    }
-
-    fn enter_command(&mut self) {
-        self.mode = Mode::Command;
-        self.command.clear();
-        self.pending_g = false;
-        self.selection_active = false;
-        self.set_status("COMMAND");
-    }
-
-    fn yank_line(&mut self) {
-        if let Some(line) = self.buffer.get(self.row) {
-            self.clipboard = Some(line.clone());
-            copy_to_system(line);
-            self.selection_active = false;
-            self.set_status("yanked");
-        }
-    }
-
-    fn delete_line(&mut self) {
-        if self.buffer.is_empty() {
+            let line = &mut self.buffer[self.row];
+            let remove_at = self.col.min(line.len());
+            if remove_at > 0 {
+                let prev = line[..remove_at].chars().last().unwrap();
+                let prev_len = prev.len_utf8();
+                let start = remove_at - prev_len;
+                line.replace_range(start..remove_at, "");
+                self.col = self.col.saturating_sub(prev_len);
+                self.dirty = true;
+            }
             return;
         }
 
-        self.push_undo();
-        self.dirty = true;
-        let removed = self.buffer.remove(self.row);
-        self.clipboard = Some(removed);
-        if self.row >= self.buffer.len() && !self.buffer.is_empty() {
-            self.row = self.buffer.len() - 1;
+        if self.row > 0 {
+            let current = self.buffer.remove(self.row);
+            self.row -= 1;
+            let line = &mut self.buffer[self.row];
+            let old_len = line.len();
+            line.push_str(&current);
+            self.col = old_len;
+            self.dirty = true;
         }
-        if self.buffer.is_empty() {
-            self.buffer.push(String::new());
-            self.row = 0;
-        }
-        self.col = 0;
-        self.ensure_cursor();
     }
 
-    fn paste_line(&mut self) {
-        if let Some(mut text) = self.clipboard.clone().or_else(read_system_clipboard) {
-            self.push_undo();
-            self.dirty = true;
-            self.selection_active = false;
-            if text.is_empty() {
-                return;
-            }
-            if !text.ends_with('\n') {
-                text.push('\n');
-            }
-            let lines: Vec<&str> = text.split('\n').collect();
-            let insert_lines = lines.len().saturating_sub(1); // trailing empty after split
-            let mut insert_at = self.row + 1;
-            for l in lines.into_iter().take(insert_lines) {
-                self.buffer.insert(insert_at, l.to_string());
-                insert_at += 1;
-            }
-            if self.buffer.is_empty() {
-                self.buffer.push(String::new());
-            }
-            let last_idx = insert_at.saturating_sub(1);
-            if last_idx < self.buffer.len() {
-                self.row = last_idx;
-                self.col = self.buffer[self.row].len();
-            } else {
-                self.row = self.buffer.len().saturating_sub(1);
-                self.col = self.buffer[self.row].len();
-            }
-            self.ensure_cursor();
+    fn save_snapshot(&mut self) {
+        self.undo.push(Snapshot {
+            buffer: self.buffer.clone(),
+            row: self.row,
+            col: self.col,
+            dirty: self.dirty,
+        });
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
         }
     }
 
     fn undo(&mut self) {
-        if let Some(snap) = self.undo.pop() {
-            self.restore(snap);
-        } else {
-            self.set_status("nothing to undo");
+        if let Some(s) = self.undo.pop() {
+            self.buffer = s.buffer;
+            self.row = s.row;
+            self.col = s.col;
+            self.dirty = s.dirty;
+            self.ensure_cursor_visible();
         }
-    }
-
-    fn move_word_start(&mut self) {
-        let line = &self.buffer[self.row];
-        if self.col >= line.len() {
-            if self.row + 1 < self.buffer.len() {
-                self.row += 1;
-                self.col = 0;
-            }
-            return;
-        }
-        let bytes = line.as_bytes();
-        let mut idx = self.col;
-        while idx < bytes.len() && bytes[idx].is_ascii_alphabetic() {
-            idx += 1;
-        }
-        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
-            idx += 1;
-        }
-        self.col = idx.min(line.len());
-    }
-
-fn move_word_end(&mut self) {
-        let line = &self.buffer[self.row];
-        if self.col >= line.len() {
-            if self.row + 1 < self.buffer.len() {
-                self.row += 1;
-                self.col = self.buffer[self.row].len();
-            }
-            return;
-        }
-        let bytes = line.as_bytes();
-        let mut idx = self.col;
-        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
-            idx += 1;
-        }
-        while idx < bytes.len() && !bytes[idx].is_ascii_whitespace() {
-            idx += 1;
-        }
-        self.col = idx.min(line.len());
-    }
-
-    fn save(&mut self, path: Option<&str>) -> bool {
-        if let Some(p) = path {
-            self.filename = Some(p.to_string());
-        }
-        let Some(name) = &self.filename else {
-            self.set_status("No file name");
-            return false;
-        };
-        self.base_plugin = root_plugin_for_filename(self.filename.as_deref());
-        match fs::write(name, self.buffer.join("\n")) {
-            Ok(_) => {
-                self.dirty = false;
-                self.set_status("written");
-                if self.use_new_highlighter {
-                    self.highlight_engine = HighlighterEngine::new(&NEW_REGISTRY, self.base_plugin);
-                    let total_len = buffer_total_len(&self.buffer);
-                    self.highlight_engine
-                        .schedule_checkpoint_build(0, total_len);
-                }
-                true
-            }
-            Err(err) => {
-                self.set_status(format!("write failed: {err}"));
-                false
-            }
-        }
-    }
-
-    fn start_selection(&mut self) {
-        self.selection_active = true;
-        self.sel_start_row = self.row;
-        self.sel_start_col = self.col;
-        self.set_status("VISUAL");
-    }
-
-    fn clear_selection(&mut self) {
-        self.selection_active = false;
-    }
-
-    fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
-        if !self.selection_active {
-            return None;
-        }
-        let start = (self.sel_start_row, self.sel_start_col);
-        let end = (self.row, self.col);
-        if start <= end {
-            Some((start, end))
-        } else {
-            Some((end, start))
-        }
-    }
-
-    fn selection_text(&self) -> Option<String> {
-        let ((sr, sc), (er, ec)) = self.selection_bounds()?;
-        if sr >= self.buffer.len() || er >= self.buffer.len() {
-            return None;
-        }
-        let mut out = String::new();
-        if sr == er {
-            let line = &self.buffer[sr];
-            let end_idx = ec.min(line.len());
-            let start_idx = sc.min(end_idx);
-            out.push_str(&line[start_idx..end_idx]);
-            return Some(out);
-        }
-
-        let first = &self.buffer[sr];
-        out.push_str(&first[sc.min(first.len())..]);
-        out.push('\n');
-        for r in (sr + 1)..er {
-            out.push_str(&self.buffer[r]);
-            out.push('\n');
-        }
-        let last = &self.buffer[er];
-        let end_idx = ec.min(last.len());
-        out.push_str(&last[..end_idx]);
-        Some(out)
     }
 
     fn yank_selection(&mut self) {
-        if let Some(text) = self.selection_text() {
-            self.clipboard = Some(text.clone());
-            copy_to_system(&text);
-            self.clear_selection();
-            self.set_status("yanked");
+        let Some(((sr, sc), (er, ec))) = self.selection_bounds() else { return; };
+        if sr >= self.buffer.len() || er >= self.buffer.len() {
+            return;
         }
-    }
 
-    fn delete_selection(&mut self) {
-        if let Some(((sr, sc), (er, ec))) = self.selection_bounds() {
-            if sr >= self.buffer.len() || er >= self.buffer.len() {
-                self.clear_selection();
-                return;
-            }
-            self.push_undo();
-            self.dirty = true;
-            let mut deleted = String::new();
-            if sr == er {
-                let line = &mut self.buffer[sr];
-                let end_idx = ec.min(line.len());
-                let start_idx = sc.min(end_idx);
-                deleted.push_str(&line[start_idx..end_idx]);
-                line.replace_range(start_idx..end_idx, "");
-                self.col = start_idx;
-                self.row = sr;
+        if sr == er {
+            let line = &self.buffer[sr];
+            let start = sc.min(line.len());
+            let end = ec.min(line.len());
+            let text = if start < end { &line[start..end] } else { "" };
+            self.clipboard = Some(text.to_string());
+            copy_to_system(text);
+            self.status = "Yanked selection".to_string();
+            return;
+        }
+
+        let mut out = String::new();
+        for r in sr..=er {
+            let line = &self.buffer[r];
+            if r == sr {
+                let start = sc.min(line.len());
+                out.push_str(&line[start..]);
+                out.push('\n');
+            } else if r == er {
+                let end = ec.min(line.len());
+                out.push_str(&line[..end]);
             } else {
-                let first = &mut self.buffer[sr];
-                let tail = first.split_off(sc.min(first.len()));
-                deleted.push_str(&tail);
-                deleted.push('\n');
-
-                for _ in (sr + 1)..er {
-                    let removed = self.buffer.remove(sr + 1);
-                    deleted.push_str(&removed);
-                    deleted.push('\n');
-                }
-
-                let last_line = &mut self.buffer[sr + 1];
-                let end_idx = ec.min(last_line.len());
-                deleted.push_str(&last_line[..end_idx]);
-                last_line.replace_range(0..end_idx, "");
-
-                let remaining = self.buffer.remove(sr + 1);
-                self.buffer[sr].push_str(&remaining);
-                self.row = sr;
-                self.col = sc;
+                out.push_str(line);
+                out.push('\n');
             }
-            if self.buffer.is_empty() {
-                self.buffer.push(String::new());
-                self.row = 0;
-                self.col = 0;
+        }
+
+        self.clipboard = Some(out.clone());
+        copy_to_system(&out);
+        self.status = "Yanked selection".to_string();
+    }
+
+    fn paste_clipboard(&mut self) {
+        let Some(text) = self.clipboard.clone() else {
+            self.status = "Clipboard empty".to_string();
+            return;
+        };
+
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.insert_newline();
+            } else {
+                self.insert_char(ch);
             }
-            self.clipboard = Some(deleted.clone());
-            copy_to_system(&deleted);
-            self.clear_selection();
-            self.ensure_cursor();
         }
+        self.status = "Pasted".to_string();
     }
 
-    fn move_up(&mut self) {
-        if self.row > 0 {
-            self.row -= 1;
-            self.ensure_cursor();
-        }
-    }
+    fn apply_command(&mut self) -> bool {
+        let cmd = self.command.trim().to_string();
+        self.command.clear();
 
-    fn move_down(&mut self) {
-        if self.row + 1 < self.buffer.len() {
-            self.row += 1;
-            self.ensure_cursor();
-        }
-    }
-
-    fn move_left(&mut self) {
-        if self.col > 0 {
-            let line = &self.buffer[self.row];
-            self.col = prev_char_boundary(line, self.col);
-        } else if self.row > 0 {
-            self.row -= 1;
-            self.col = self.buffer[self.row].len();
-        }
-        self.ensure_cursor();
-    }
-
-    fn move_right(&mut self) {
-        let len = self.buffer[self.row].len();
-        if self.col < len {
-            let line = &self.buffer[self.row];
-            self.col = next_char_boundary(line, self.col);
-        } else if self.row + 1 < self.buffer.len() {
-            self.row += 1;
-            self.col = 0;
-        }
-        self.ensure_cursor();
-    }
-
-    fn open_file(&mut self, path: &str) {
-        match fs::read_to_string(path) {
-            Ok(content) => {
-                self.push_undo();
-                self.buffer = content.lines().map(|l| l.to_string()).collect();
-                if self.buffer.is_empty() {
-                    self.buffer.push(String::new());
-                }
-                self.row = 0;
-                self.col = 0;
-                self.filename = Some(path.to_string());
-                self.base_plugin = root_plugin_for_filename(self.filename.as_deref());
-                self.dirty = false;
-                self.set_status(format!("opened {path}"));
-                if self.use_new_highlighter {
-                    self.highlight_engine = HighlighterEngine::new(&NEW_REGISTRY, self.base_plugin);
-                    self.highlight_engine.checkpoints.clear();
-                    let total_len = buffer_total_len(&self.buffer);
-                    self.highlight_engine
-                        .schedule_checkpoint_build(0, total_len);
-                }
-            }
-            Err(err) => self.set_status(format!("open failed: {err}")),
-        }
-        self.scroll = 0;
-        self.ensure_cursor();
-    }
-
-    fn scroll_up(&mut self, lines: usize) {
-        if self.row > 0 {
-            self.row = self.row.saturating_sub(lines);
-        }
-        self.ensure_cursor();
-    }
-
-    fn scroll_down(&mut self, lines: usize) {
-        if self.row + 1 < self.buffer.len() {
-            self.row = (self.row + lines).min(self.buffer.len().saturating_sub(1));
-        }
-        self.ensure_cursor();
-    }
-}
-
-fn read_key(stdin: &mut StdinLock) -> io::Result<Key> {
-    let mut buf = [0u8; 1];
-    loop {
-        let read = stdin.read(&mut buf)?;
-        if read == 0 {
-            continue;
-        }
-        let b = buf[0];
-        return Ok(match b {
-            b'\r' | b'\n' => Key::Enter,
-            127 | 8 => Key::Backspace,
-            27 => {
-                // Escape sequence or bare Esc
-                let mut seq = [0u8; 2];
-                let first = stdin.read(&mut seq[..1])?;
-                if first == 0 {
-                    Key::Esc
-                } else if seq[0] != b'[' {
-                    Key::Esc
+        match cmd.as_str() {
+            "q" => return true,
+            "w" => {
+                if let Some(fname) = self.filename.clone() {
+                    let content = self.buffer.join("\n");
+                    let _ = fs::write(fname, content);
+                    self.dirty = false;
+                    self.status = "Saved".to_string();
                 } else {
-                    let second_read = stdin.read(&mut seq[1..2])?;
-                    if second_read == 0 {
-                        Key::Esc
-                    } else {
-                        match seq[1] {
-                            b'A' => Key::Up,
-                            b'B' => Key::Down,
-                            b'C' => Key::Right,
-                            b'D' => Key::Left,
-                            b'H' => Key::Home,
-                            b'F' => Key::End,
-                            b'1' | b'7' => {
-                                let mut tilde = [0u8; 1];
-                                if stdin.read(&mut tilde)? == 1 && tilde[0] == b'~' {
-                                    Key::Home
-                                } else {
-                                    Key::Esc
-                                }
-                            }
-                            b'4' | b'8' => {
-                                let mut tilde = [0u8; 1];
-                                if stdin.read(&mut tilde)? == 1 && tilde[0] == b'~' {
-                                    Key::End
-                                } else {
-                                    Key::Esc
-                                }
-                            }
-                            b'<' => {
-                                // SGR mouse mode: \x1b[<btn;col;rowM
-                                let mut data = Vec::new();
-                                let mut byte_buf = [0u8; 1];
-                                loop {
-                                    let r = stdin.read(&mut byte_buf)?;
-                                    if r == 0 {
-                                        continue;
-                                    }
-                                    let c = byte_buf[0];
-                                    if c == b'M' || c == b'm' {
-                                        break;
-                                    }
-                                    data.push(c);
-                                }
-                                let text = String::from_utf8_lossy(&data);
-                                let mut parts = text.split(';');
-                                let btn = parts.next().and_then(|s| s.parse::<i32>().ok());
-                                match btn {
-                                    Some(64) => Key::WheelUp,
-                                    Some(65) => Key::WheelDown,
-                                    _ => Key::Esc,
-                                }
-                            }
-                            _ => Key::Esc,
-                        }
-                    }
+                    self.status = "No filename".to_string();
                 }
             }
-            b'G' => Key::G,
-            b'g' => Key::LittleG,
-            byte if byte >= 0x80 => Key::Unknown, // ignore non-ASCII input for stability
+            "wq" => {
+                if let Some(fname) = self.filename.clone() {
+                    let content = self.buffer.join("\n");
+                    let _ = fs::write(fname, content);
+                    self.dirty = false;
+                    return true;
+                } else {
+                    self.status = "No filename".to_string();
+                }
+            }
             _ => {
-                if let Some(ch) = char::from_u32(b as u32) {
-                    Key::Char(ch)
-                } else {
-                    continue;
-                }
+                self.status = format!("Unknown command: {}", cmd);
             }
-        });
+        }
+        false
     }
 }
 
-fn color_links(line: &str, base_color: Option<&str>) -> String {
-    let mut out = String::new();
-    if let Some(color) = base_color {
-        out.push_str(color);
+fn copy_to_system(text: &str) {
+    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        if let Some(stdin) = &mut child.stdin {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        return;
     }
 
-    let mut idx = 0;
-    let bytes = line.as_bytes();
-    while let Some(rel_start) = line[idx..].find('[') {
-        let start = idx + rel_start;
-        // find "]("
-        if let Some(rel_mid) = line[start..].find("](") {
-            let mid = start + rel_mid;
-            if let Some(rel_end) = line[mid + 2..].find(')') {
-                let end = mid + 2 + rel_end;
-                out.push_str(&line[idx..start]);
-                let link = &line[start..=end];
-                out.push_str(LINK_COLOR);
-                out.push_str(link);
-                if let Some(color) = base_color {
-                    out.push_str(color);
-                } else {
-                    out.push_str(RESET);
-                }
-                idx = end + 1;
-                continue;
-            }
+    if let Ok(mut child) = Command::new("xclip")
+        .args(["-selection", "clipboard"])
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        if let Some(stdin) = &mut child.stdin {
+            let _ = stdin.write_all(text.as_bytes());
         }
-        out.push_str(&line[idx..=start]);
-        idx = start + 1;
+        let _ = child.wait();
     }
-    if idx < bytes.len() {
-        out.push_str(&line[idx..]);
-    }
-    out
 }
 
 fn compute_line_starts(lines: &[String]) -> Vec<usize> {
@@ -946,368 +532,214 @@ fn buffer_total_len(lines: &[String]) -> usize {
     total
 }
 
-fn token_color(kind: TokenKind) -> Option<&'static str> {
-    match kind {
-        TokenKind::MdHeading => Some(HEADER_COLOR),
-        TokenKind::MdFence | TokenKind::MdCodeSpan => Some(CODE_COLOR),
-        TokenKind::MdEmph => Some("\u{1b}[35m"),
-        TokenKind::Keyword => Some("\u{1b}[1;34m"),
-        TokenKind::String => Some("\u{1b}[38;5;114m"),
-        TokenKind::Comment => Some("\u{1b}[38;5;244m"),
-        TokenKind::Number => Some("\u{1b}[1;33m"),
-        TokenKind::Tag | TokenKind::AttrName => Some("\u{1b}[1;35m"),
-        TokenKind::AttrValue => Some("\u{1b}[38;5;180m"),
-        TokenKind::Var => Some("\u{1b}[32m"),
-        TokenKind::Operator => Some("\u{1b}[1;37m"),
-        _ => None,
-    }
-}
-
-fn render_segment(
-    full_text: &str,
-    start: usize,
-    end: usize,
-    base_color: Option<&str>,
-    selection_abs: Option<(usize, usize)>,
-) -> String {
-    if start >= end || start >= full_text.len() {
-        return String::new();
+fn read_key(stdin: &mut StdinLock<'_>) -> Key {
+    let mut buf = [0u8; 8];
+    let n = match stdin.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => 0,
+    };
+    if n == 0 {
+        return Key::Unknown;
     }
 
-    let end = end.min(full_text.len());
-    if let Some((sel_start, sel_end)) = selection_abs {
-        if sel_end <= start || sel_start >= end {
-            let mut out = color_links(&full_text[start..end], base_color);
-            out.push_str(RESET);
-            return out;
+    if buf[0] == b'\x1b' {
+        if n >= 3 && buf[1] == b'[' {
+            match buf[2] {
+                b'A' => return Key::Up,
+                b'B' => return Key::Down,
+                b'C' => return Key::Right,
+                b'D' => return Key::Left,
+                b'H' => return Key::Home,
+                b'F' => return Key::End,
+                b'M' => {
+                    if n >= 6 {
+                        let button = buf[3];
+                        if button == b'`' || button == b'a' {
+                            return Key::WheelUp;
+                        }
+                        if button == b'b' || button == b'c' {
+                            return Key::WheelDown;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
-
-        let sel_s = sel_start.max(start);
-        let sel_e = sel_end.min(end);
-
-        let mut out = String::new();
-        if start < sel_s {
-            out.push_str(&color_links(&full_text[start..sel_s], base_color));
-            out.push_str(RESET);
-        }
-
-        out.push_str(SEL_BG);
-        if let Some(color) = base_color {
-            out.push_str(color);
-        }
-        out.push_str(&full_text[sel_s..sel_e]);
-        out.push_str(RESET);
-
-        if sel_e < end {
-            out.push_str(&color_links(&full_text[sel_e..end], base_color));
-            out.push_str(RESET);
-        }
-        return out;
+        return Key::Esc;
     }
 
-    let mut out = color_links(&full_text[start..end], base_color);
-    out.push_str(RESET);
-    out
-}
-
-fn copy_to_system(text: &str) {
-    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
-        if let Some(stdin) = &mut child.stdin {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
-        return;
+    if buf[0] == b'\r' || buf[0] == b'\n' {
+        return Key::Enter;
+    }
+    if buf[0] == 127u8 {
+        return Key::Backspace;
     }
 
-    if let Ok(mut child) = Command::new("xclip")
-        .args(["-selection", "clipboard"])
-        .stdin(Stdio::piped())
-        .spawn()
-    {
-        if let Some(stdin) = &mut child.stdin {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
+    let ch = buf[0] as char;
+    match ch {
+        'g' => Key::LittleG,
+        'G' => Key::G,
+        _ => Key::Char(ch),
     }
-}
-
-fn read_system_clipboard() -> Option<String> {
-    if let Ok(output) = Command::new("pbpaste").output() {
-        if output.status.success() {
-            return String::from_utf8(output.stdout).ok();
-        }
-    }
-    if let Ok(output) = Command::new("xclip")
-        .args(["-o", "-selection", "clipboard"])
-        .output()
-    {
-        if output.status.success() {
-            return String::from_utf8(output.stdout).ok();
-        }
-    }
-    None
-}
-
-fn clamp_char_boundary(line: &str, col: usize) -> usize {
-    if col >= line.len() {
-        return line.len();
-    }
-    if line.is_char_boundary(col) {
-        col
-    } else {
-        let mut c = col;
-        while c > 0 && !line.is_char_boundary(c) {
-            c -= 1;
-        }
-        c
-    }
-}
-
-fn prev_char_boundary(line: &str, col: usize) -> usize {
-    if col == 0 {
-        return 0;
-    }
-    let mut c = col.saturating_sub(1).min(line.len());
-    while c > 0 && !line.is_char_boundary(c) {
-        c -= 1;
-    }
-    c
-}
-
-fn next_char_boundary(line: &str, col: usize) -> usize {
-    if col >= line.len() {
-        return line.len();
-    }
-    let mut c = col + 1;
-    while c < line.len() && !line.is_char_boundary(c) {
-        c += 1;
-    }
-    c.min(line.len())
-}
-
-fn root_plugin_for_filename(name: Option<&str>) -> NewPluginId {
-    if let Some(name) = name {
-        if let Some(ext) = Path::new(name).extension().and_then(|s| s.to_str()) {
-            let lower = ext.to_ascii_lowercase();
-            return match lower.as_str() {
-                "md" | "markdown" => NewPluginId::Markdown,
-                "sh" | "bash" => NewPluginId::Bash,
-                "js" | "mjs" | "cjs" => NewPluginId::Js,
-                "html" | "htm" => NewPluginId::HtmlText,
-                _ => NewPluginId::Markdown,
-            };
-        }
-    }
-    NewPluginId::Markdown
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let mut args = env::args().skip(1);
+    let file = args.next();
 
-    let _raw = RawModeGuard::new().unwrap_or_else(|_| {
-        eprintln!("Failed to enter raw mode");
-        process::exit(1);
-    });
+    let _raw = match RawModeGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Failed to enter raw mode: {e}");
+            process::exit(1);
+        }
+    };
 
-    let term_rows = Command::new("stty")
-        .arg("size")
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|s| {
-            let mut parts = s.split_whitespace();
-            parts.next()?.parse::<usize>().ok()
-        })
-        .unwrap_or(24);
+    let screen_rows = 24;
+    let mut editor = Editor::open(file.as_deref(), screen_rows);
 
-    let mut editor = Editor::open(args.get(1).map(|s| s.as_str()), term_rows);
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
 
-    editor.render();
-
     loop {
-        let key = match read_key(&mut stdin) {
-            Ok(k) => k,
-            Err(_) => continue,
-        };
+        editor.ensure_cursor_visible();
+        editor.render();
 
+        let key = read_key(&mut stdin);
         match editor.mode {
-            Mode::Insert => match key {
-                Key::Esc => editor.enter_normal(),
-                Key::Backspace => editor.backspace(),
-                Key::Enter => editor.new_line(),
-                Key::Home => editor.col = 0,
-                Key::End => editor.col = editor.buffer[editor.row].len(),
-                Key::Up => editor.move_up(),
-                Key::Down => editor.move_down(),
-                Key::Left => editor.move_left(),
-                Key::Right => editor.move_right(),
-                Key::WheelUp => editor.scroll_up(3),
-                Key::WheelDown => editor.scroll_down(3),
-                Key::LittleG => editor.insert_char('g'),
-                Key::G => editor.insert_char('G'),
-                Key::Char(ch) if !ch.is_control() => editor.insert_char(ch),
-                Key::Unknown => editor.set_status("Non-ASCII input not supported"),
-                _ => {}
-            },
-            Mode::Command => match key {
-                Key::Esc => editor.enter_normal(),
-                Key::Enter => {
-                    let cmd = editor.command.trim().to_string();
-                    editor.enter_normal();
-                    let mut parts = cmd.split_whitespace();
-                    let head = parts.next().unwrap_or("");
-                    let arg = parts.next();
-                    match head {
-                        "q!" => break,
-                        "q" => {
-                            if editor.dirty {
-                                editor.set_status("Unsaved changes");
-                            } else {
-                                break;
-                            }
-                        }
-                        "w" => {
-                            let path = arg.filter(|s| !s.is_empty());
-                            editor.save(path);
-                        }
-                        "wq" => {
-                            let path = arg.filter(|s| !s.is_empty());
-                            if editor.save(path) {
-                                break;
-                            } else {
-                                editor.set_status("No file name");
-                            }
-                        }
-                        "e" => {
-                            if let Some(p) = arg {
-                                editor.open_file(p);
-                            } else {
-                                editor.set_status("Missing file name");
-                            }
-                        }
-                        "" => {}
-                        _ => editor.set_status(format!("Unknown :{cmd}")),
-                    }
-                }
-                Key::Backspace => {
-                    editor.command.pop();
-                }
-                Key::Home => {}
-                Key::End => {}
-                Key::Up | Key::Down | Key::Left | Key::Right | Key::WheelUp | Key::WheelDown => {}
-                Key::Char(ch) if !ch.is_control() => editor.command.push(ch),
-                Key::Unknown => {}
-                _ => {}
-            },
             Mode::Normal => {
-                if editor.pending_g {
-                    editor.pending_g = false;
-                    if matches!(key, Key::LittleG) {
-                        editor.row = 0;
-                        editor.col = 0;
-                        editor.ensure_cursor();
-                        editor.render();
-                        continue;
-                    }
-                }
-
                 match key {
-                    Key::Esc => editor.enter_normal(),
-                    Key::Char(':') => editor.enter_command(),
-                    Key::Char('i') => editor.enter_insert(),
-                    Key::Char('I') => {
-                        editor.col = 0;
-                        editor.enter_insert();
-                    }
-                    Key::Char('a') => {
-                        editor.col = editor
-                            .col
-                            .saturating_add(1)
-                            .min(editor.buffer[editor.row].len());
-                        editor.enter_insert();
-                    }
-                    Key::Char('A') => {
-                        editor.col = editor.buffer[editor.row].len();
-                        editor.enter_insert();
-                    }
-                    Key::Char('o') => {
-                        editor.push_undo();
-                        editor.dirty = true;
-                        editor.row += 1;
-                        editor.buffer.insert(editor.row, String::new());
-                        editor.col = 0;
-                        editor.enter_insert();
-                    }
-                    Key::Char('O') => {
-                        editor.push_undo();
-                        editor.dirty = true;
-                        editor.buffer.insert(editor.row, String::new());
-                        editor.col = 0;
-                        editor.enter_insert();
+                    Key::Char('i') => {
+                        editor.mode = Mode::Insert;
+                        editor.status.clear();
                     }
                     Key::Char('v') => {
-                        if editor.selection_active {
-                            editor.clear_selection();
-                            editor.set_status("NORMAL");
-                        } else {
-                            editor.start_selection();
-                        }
+                        editor.selection_active = true;
+                        editor.sel_start_row = editor.row;
+                        editor.sel_start_col = editor.col;
+                        editor.status = "Visual mode".to_string();
                     }
                     Key::Char('y') => {
                         if editor.selection_active {
                             editor.yank_selection();
-                        } else if let Ok(Key::Char('y')) = read_key(&mut stdin) {
-                            editor.yank_line();
-                            copy_to_system(editor.clipboard.as_deref().unwrap_or_default());
+                            editor.selection_active = false;
+                        } else {
+                            editor.status = "No selection".to_string();
                         }
                     }
-                    Key::Char('d') => {
-                        if let Ok(Key::Char('d')) = read_key(&mut stdin) {
-                            editor.delete_line();
-                        }
+                    Key::Char('p') => {
+                        editor.paste_clipboard();
                     }
-                    Key::Char('p') => editor.paste_line(),
-                    Key::Char('x') => {
-                        if editor.selection_active {
-                            editor.delete_selection();
-                        } else if !editor.buffer.is_empty() {
-                            editor.push_undo();
-                            editor.dirty = true;
-                            let line = &mut editor.buffer[editor.row];
-                            if editor.col < line.len() {
-                                let ch = line.remove(editor.col).to_string();
-                                editor.clipboard = Some(ch.clone());
-                                copy_to_system(&ch);
-                            }
-                            editor.ensure_cursor();
-                        }
+                    Key::Char('u') => {
+                        editor.undo();
                     }
-                    Key::Char('u') => editor.undo(),
-                    Key::Char('w') => editor.move_word_start(),
-                    Key::Char('e') => editor.move_word_end(),
-                    Key::Home => editor.col = 0,
-                    Key::End => editor.col = editor.buffer[editor.row].len(),
-                    Key::Up => editor.move_up(),
-                    Key::Down => editor.move_down(),
-                    Key::Left => editor.move_left(),
-                    Key::Right => editor.move_right(),
-                    Key::WheelUp => editor.scroll_up(3),
-                    Key::WheelDown => editor.scroll_down(3),
-                    Key::G => {
-                        editor.row = editor.buffer.len().saturating_sub(1);
-                        editor.col = editor.buffer[editor.row].len();
+                    Key::Char(':') => {
+                        editor.mode = Mode::Command;
+                        editor.command.clear();
                     }
                     Key::LittleG => {
-                        editor.pending_g = true;
+                        if editor.pending_g {
+                            editor.row = 0;
+                            editor.col = 0;
+                            editor.pending_g = false;
+                        } else {
+                            editor.pending_g = true;
+                        }
+                    }
+                    Key::G => {
+                        if !editor.buffer.is_empty() {
+                            editor.row = editor.buffer.len() - 1;
+                            editor.col = editor.col.min(editor.buffer[editor.row].len());
+                        }
+                        editor.pending_g = false;
+                    }
+                    Key::Up => {
+                        editor.row = editor.row.saturating_sub(1);
+                        editor.col = editor.col.min(editor.buffer[editor.row].len());
+                        editor.pending_g = false;
+                    }
+                    Key::Down => {
+                        if editor.row + 1 < editor.buffer.len() {
+                            editor.row += 1;
+                            editor.col = editor.col.min(editor.buffer[editor.row].len());
+                        }
+                        editor.pending_g = false;
+                    }
+                    Key::Left => {
+                        editor.col = editor.col.saturating_sub(1);
+                        editor.pending_g = false;
+                    }
+                    Key::Right => {
+                        editor.col = (editor.col + 1).min(editor.buffer[editor.row].len());
+                        editor.pending_g = false;
+                    }
+                    Key::WheelUp => {
+                        editor.scroll = editor.scroll.saturating_sub(3);
+                    }
+                    Key::WheelDown => {
+                        let total = buffer_total_len(&editor.buffer);
+                        if total > 0 {
+                            editor.scroll = (editor.scroll + 3).min(editor.buffer.len().saturating_sub(1));
+                        }
+                    }
+                    Key::Esc => {
+                        editor.selection_active = false;
+                        editor.pending_g = false;
+                    }
+                    _ => {
+                        editor.pending_g = false;
+                    }
+                }
+            }
+            Mode::Insert => {
+                match key {
+                    Key::Esc => {
+                        editor.mode = Mode::Normal;
+                        editor.pending_g = false;
+                    }
+                    Key::Enter => {
+                        editor.save_snapshot();
+                        editor.insert_newline();
+                    }
+                    Key::Backspace => {
+                        editor.save_snapshot();
+                        editor.backspace();
+                    }
+                    Key::Char(c) => {
+                        editor.save_snapshot();
+                        editor.insert_char(c);
+                    }
+                    _ => {}
+                }
+            }
+            Mode::Command => {
+                match key {
+                    Key::Esc => {
+                        editor.mode = Mode::Normal;
+                        editor.command.clear();
+                    }
+                    Key::Enter => {
+                        let should_quit = editor.apply_command();
+                        editor.mode = Mode::Normal;
+                        if should_quit {
+                            print!("\x1b[2J\x1b[H");
+                            let _ = io::stdout().flush();
+                            break;
+                        }
+                    }
+                    Key::Backspace => {
+                        editor.command.pop();
+                    }
+                    Key::Char(c) => {
+                        editor.command.push(c);
                     }
                     _ => {}
                 }
             }
         }
-
-        editor.ensure_cursor();
-        editor.render();
     }
+
+    print!("{RESET}");
+    let _ = io::stdout().flush();
 }
+
