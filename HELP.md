@@ -11,7 +11,7 @@ md-rush [options] [file]
 ## Options
 
 - `-p`, `--print`  Print the highlighted contents of `file` to stdout and exit (no editor UI).
-- `-c`, `--copy`   Copy entire `file` to the system clipboard and print its first 3 lines.
+- `-c`, `--copy`   Copy entire `file` to the system clipboard and log `:: copy to clip >> <file>`.
 - `-h`, `--help`, `-?`  Show this help text.
 
 ## Editor basics

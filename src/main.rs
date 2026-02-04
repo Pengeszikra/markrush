@@ -853,12 +853,7 @@ fn copy_file_and_preview(path: &str) -> io::Result<()> {
     let content = fs::read_to_string(path)?;
     copy_to_system(&content);
 
-    for (idx, line) in content.lines().enumerate() {
-        if idx >= 3 {
-            break;
-        }
-        println!("{line}");
-    }
+    println!(":: copy to clip >> {path}");
     Ok(())
 }
 
