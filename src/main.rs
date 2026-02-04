@@ -184,22 +184,8 @@ impl Editor {
     }
 
     fn refresh_terminal_rows(&mut self) {
-        let mut rows_opt = None;
-
-        if let Ok(out) = Command::new("stty").arg("size").output() {
-            if let Ok(s) = String::from_utf8(out.stdout) {
-                rows_opt = s
-                    .split_whitespace()
-                    .next()
-                    .and_then(|p| p.parse::<usize>().ok());
-            }
-        }
-
-        if let Some(r) = rows_opt {
-            self.screen_rows = r.max(3);
-        } else {
-            self.screen_rows = 24;
-        }
+        let rows = read_terminal_size().map(|(r, _)| r).unwrap_or(24);
+        self.screen_rows = rows.max(3);
     }
 
     fn run_new_highlighter(&mut self, full_text: &str, line_starts: &[usize], content_rows: usize) {
@@ -538,6 +524,30 @@ fn max_scroll(buffer_len: usize, screen_rows: usize) -> usize {
     }
 }
 
+fn read_terminal_size() -> Option<(usize, usize)> {
+    // Try ioctl first for accurate size.
+    #[cfg(unix)]
+    {
+        if let Some(ws) = unix_winsize() {
+            return Some(ws);
+        }
+    }
+
+    // Fallback to `stty size`.
+    if let Ok(out) = Command::new("stty").arg("size").output() {
+        if let Ok(s) = String::from_utf8(out.stdout) {
+            let mut parts = s.split_whitespace();
+            if let (Some(r), Some(c)) = (parts.next(), parts.next()) {
+                if let (Ok(r), Ok(c)) = (r.parse::<usize>(), c.parse::<usize>()) {
+                    return Some((r, c));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn select_plugin_for_path(path: &str) -> NewPluginId {
     let ext = Path::new(path)
         .extension()
@@ -550,6 +560,46 @@ fn select_plugin_for_path(path: &str) -> NewPluginId {
         Some("sh") | Some("bash") => NewPluginId::Bash,
         _ => NewPluginId::Markdown,
     }
+}
+
+#[cfg(unix)]
+fn unix_winsize() -> Option<(usize, usize)> {
+    use std::os::raw::{c_int, c_ulong};
+
+    #[repr(C)]
+    struct WinSize {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    }
+
+    const STDOUT_FD: c_int = 1;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const TIOCGWINSZ: c_ulong = 0x5413;
+    #[cfg(target_os = "macos")]
+    const TIOCGWINSZ: c_ulong = 0x40087468;
+    #[cfg(target_os = "freebsd")]
+    const TIOCGWINSZ: c_ulong = 0x40087468;
+    #[cfg(target_os = "netbsd")]
+    const TIOCGWINSZ: c_ulong = 0x40087468;
+    #[cfg(target_os = "openbsd")]
+    const TIOCGWINSZ: c_ulong = 0x40087468;
+
+    extern "C" {
+        fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    }
+
+    unsafe {
+        let mut ws = WinSize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+        if ioctl(STDOUT_FD, TIOCGWINSZ, &mut ws) == 0 {
+            if ws.ws_row > 0 && ws.ws_col > 0 {
+                return Some((ws.ws_row as usize, ws.ws_col as usize));
+            }
+        }
+    }
+    None
 }
 
 fn read_key(stdin: &mut StdinLock<'_>) -> Key {
@@ -643,7 +693,7 @@ fn main() {
         }
     };
 
-    let screen_rows = 24;
+    let screen_rows = read_terminal_size().map(|(r, _)| r).unwrap_or(24);
     let mut editor = Editor::open(file.as_deref(), screen_rows);
 
     let stdin = io::stdin();
