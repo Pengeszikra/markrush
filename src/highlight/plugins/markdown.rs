@@ -42,7 +42,7 @@ pub fn scan_markdown_custom(src: &str, pos: usize, _state: &mut State) -> Option
 language_plugin! {
     id: Markdown,
     name: "markdown",
-    extensions: ["md","markdown"],
+    extensions: ["md","markdown","rush"],
 
     keywords: [],
 
@@ -61,4 +61,3 @@ language_plugin! {
     entry_style: MdFence,
     scan_custom: Some(scan_markdown_custom)
 }
-

@@ -35,3 +35,11 @@ const (p) => {
   }
 }
 ```
+
+## RUST example
+```rust
+  print!("hello speed rust!");
+```
+
+
+

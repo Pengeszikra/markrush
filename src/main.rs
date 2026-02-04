@@ -616,6 +616,7 @@ fn select_plugin_for_path(path: &str) -> NewPluginId {
         Some("js") | Some("mjs") | Some("cjs") => NewPluginId::Js,
         Some("html") | Some("htm") => NewPluginId::HtmlText,
         Some("sh") | Some("bash") => NewPluginId::Bash,
+        Some("rush") | Some("md") | Some("markdown") => NewPluginId::Markdown,
         _ => NewPluginId::Markdown,
     }
 }
