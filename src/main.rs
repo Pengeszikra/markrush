@@ -485,12 +485,19 @@ impl Editor {
         self.status = "Pasted".to_string();
     }
 
-    fn apply_command(&mut self) -> bool {
-        let cmd = self.command.trim().to_string();
-        self.command.clear();
+fn apply_command(&mut self) -> bool {
+    let cmd = self.command.trim().to_string();
+    self.command.clear();
 
-        match cmd.as_str() {
-            "q" => return true,
+    match cmd.as_str() {
+        "q" => {
+            if self.dirty {
+                self.status = "No write since last change (add ! to override)".to_string();
+                return false;
+            }
+            return true;
+        }
+        "q!" => return true,
             "w" => {
                 if let Some(fname) = self.filename.clone() {
                     let content = self.buffer.join("\n");
@@ -511,12 +518,22 @@ impl Editor {
                     self.status = "No filename".to_string();
                 }
             }
+            "wq!" => {
+                if let Some(fname) = self.filename.clone() {
+                    let content = self.buffer.join("\n");
+                    let _ = fs::write(fname, content);
+                    self.dirty = false;
+                    return true;
+                } else {
+                    self.status = "No filename".to_string();
+                }
+            }
             _ => {
                 self.status = format!("Unknown command: {}", cmd);
             }
-        }
-        false
     }
+    false
+}
 }
 
 fn copy_to_system(text: &str) {
@@ -924,22 +941,31 @@ fn main() {
             Mode::Normal => {
                 match key {
                     Key::Char('i') => {
+                        editor.pending_g = false;
                         editor.mode = Mode::Insert;
                         editor.status.clear();
                     }
                     Key::Char('A') => {
                         editor.command_append_line_end();
                     }
+                    Key::Char('I') => {
+                        editor.col = 0;
+                        editor.pending_g = false;
+                        editor.mode = Mode::Insert;
+                        editor.status.clear();
+                    }
                     Key::Char('o') => {
                         editor.open_line_below();
                     }
                     Key::Char('v') => {
+                        editor.pending_g = false;
                         editor.selection_active = true;
                         editor.sel_start_row = editor.row;
                         editor.sel_start_col = editor.col;
                         editor.status = "Visual mode".to_string();
                     }
                     Key::Char('y') => {
+                        editor.pending_g = false;
                         if editor.selection_active {
                             editor.yank_selection();
                             editor.selection_active = false;
@@ -948,12 +974,15 @@ fn main() {
                         }
                     }
                     Key::Char('p') => {
+                        editor.pending_g = false;
                         editor.paste_clipboard();
                     }
                     Key::Char('u') => {
+                        editor.pending_g = false;
                         editor.undo();
                     }
                     Key::Char(':') => {
+                        editor.pending_g = false;
                         editor.mode = Mode::Command;
                         editor.command.clear();
                     }
@@ -1003,6 +1032,7 @@ fn main() {
                         editor.pending_g = false;
                     }
                     Key::WheelUp => {
+                        editor.pending_g = false;
                         if !editor.buffer.is_empty() {
                             editor.row = clamp_row(editor.row.saturating_sub(3), &editor.buffer);
                             editor.col = editor.col.min(editor.buffer[editor.row].len());
@@ -1024,6 +1054,7 @@ fn main() {
                         if content_rows > 0 {
                             editor.scroll = (editor.scroll + 3).min(max_scroll);
                         }
+                        editor.pending_g = false;
                     }
                     Key::Esc => {
                         editor.selection_active = false;
@@ -1052,6 +1083,14 @@ fn main() {
                         editor.save_snapshot();
                         editor.insert_char(c);
                     }
+                    Key::LittleG => {
+                        editor.save_snapshot();
+                        editor.insert_char('g');
+                    }
+                    Key::G => {
+                        editor.save_snapshot();
+                        editor.insert_char('G');
+                    }
                     _ => {}
                 }
             }
@@ -1060,6 +1099,7 @@ fn main() {
                     Key::Esc => {
                         editor.mode = Mode::Normal;
                         editor.command.clear();
+                        editor.pending_g = false;
                     }
                     Key::Enter => {
                         let should_quit = editor.apply_command();
@@ -1070,12 +1110,19 @@ fn main() {
                             break;
                         }
                         needs_render = true;
+                        editor.pending_g = false;
                     }
                     Key::Backspace => {
                         editor.command.pop();
                     }
                     Key::Char(c) => {
                         editor.command.push(c);
+                    }
+                    Key::LittleG => {
+                        editor.command.push('g');
+                    }
+                    Key::G => {
+                        editor.command.push('G');
                     }
                     _ => {}
                 }

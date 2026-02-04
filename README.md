@@ -5,6 +5,7 @@
 <!-- bit interesting -->
 ```
 
+
 This is a minimalist CLI code editor, 
 written in rust. Start as markdown editor - super
 with real time syntax highlithing.
@@ -41,5 +42,4 @@ const (p) => {
   print!("hello speed rust!");
 ```
 
-
-
+> good or bad?
