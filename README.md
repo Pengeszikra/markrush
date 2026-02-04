@@ -6,8 +6,9 @@
 ```
 
 This is a minimalist CLI code editor, 
-written in rust. Start as markdown editor
+written in rust. Start as markdown editor - super
 with real time syntax highlithing.
+
 
 README.md also writen itself.
 
@@ -17,7 +18,6 @@ README.md also writen itself.
 cargo run
 ./target/debug/md-rush README.md
 ```
-
 ## latest modification:
 visual mode, yank and paste working
 even for outside of this editor.

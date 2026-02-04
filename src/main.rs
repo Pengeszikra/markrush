@@ -73,6 +73,12 @@ struct Snapshot {
     dirty: bool,
 }
 
+struct CliConfig {
+    file: Option<String>,
+    print_mode: bool,
+    help: bool,
+}
+
 struct Editor {
     buffer: Vec<String>,
     row: usize,
@@ -109,15 +115,7 @@ impl Editor {
     fn open(path: Option<&str>, screen_rows: usize) -> Self {
         let (buffer, filename) = if let Some(path) = path {
             let buf = if Path::new(path).exists() {
-                let content = fs::read_to_string(path).unwrap_or_default();
-                let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-                if content.ends_with('\n') {
-                    lines.push(String::new());
-                }
-                if lines.is_empty() {
-                    lines.push(String::new());
-                }
-                lines
+                load_buffer(path)
             } else {
                 vec![String::new()]
             };
@@ -174,7 +172,27 @@ impl Editor {
         }
     }
 
+    fn clamp_cursor(&mut self) {
+        if self.buffer.is_empty() {
+            self.buffer.push(String::new());
+        }
+        let max_row = self.buffer.len().saturating_sub(1);
+        if self.row > max_row {
+            self.row = max_row;
+        }
+        let line_len = self.buffer.get(self.row).map(|l| l.len()).unwrap_or(0);
+        if self.col > line_len {
+            self.col = line_len;
+        }
+    }
+
     fn ensure_cursor_visible(&mut self) {
+        let max_scroll = max_scroll(self.buffer.len(), self.screen_rows);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
+        }
+
+        self.clamp_cursor();
         let content_rows = self.screen_rows.saturating_sub(1);
         if self.row < self.scroll {
             self.scroll = self.row;
@@ -229,6 +247,8 @@ impl Editor {
 
         let content_rows = self.screen_rows.saturating_sub(1);
 
+        self.clamp_cursor();
+
         let full_text = self.buffer.join("\n");
         let line_starts = compute_line_starts(&self.buffer);
 
@@ -275,8 +295,10 @@ impl Editor {
             self.status.clone()
         };
 
-        println!(
-            "\x1b[7m{} | {} | line {} col {} | spans {}{}\x1b[0m",
+        let status_row = content_rows + 1;
+        print!(
+            "\x1b[{};1H\x1b[2K\x1b[7m{} | {} | line {} col {} | spans {}{}\x1b[0m",
+            status_row,
             mode_label,
             status_text,
             self.row + 1,
@@ -290,11 +312,7 @@ impl Editor {
             let cursor_col = mode_label.len() + 4 + self.command.len(); // after "MODE | :"
             print!("\x1b[{};{}H", cursor_row, cursor_col.max(1));
         } else {
-            let cursor_row = self
-                .row
-                .saturating_sub(self.scroll)
-                .saturating_add(1)
-                .min(content_rows);
+            let cursor_row = self.row.saturating_sub(self.scroll).saturating_add(1).max(1);
             let cursor_col = self.col + 1;
             print!("\x1b[{};{}H", cursor_row, cursor_col);
         }
@@ -361,6 +379,33 @@ impl Editor {
             self.col = old_len;
             self.dirty = true;
         }
+    }
+
+    fn command_append_line_end(&mut self) {
+        self.clamp_cursor();
+        self.col = self.buffer[self.row].len();
+        self.pending_g = false;
+        self.mode = Mode::Insert;
+        self.status.clear();
+    }
+
+    fn open_line_below(&mut self) {
+        self.clamp_cursor();
+        self.save_snapshot();
+
+        let insert_at = (self.row + 1).min(self.buffer.len());
+        if insert_at >= self.buffer.len() {
+            self.buffer.push(String::new());
+        } else {
+            self.buffer.insert(insert_at, String::new());
+        }
+
+        self.row = insert_at;
+        self.col = 0;
+        self.pending_g = false;
+        self.mode = Mode::Insert;
+        self.dirty = true;
+        self.status.clear();
     }
 
     fn save_snapshot(&mut self) {
@@ -524,6 +569,18 @@ fn max_scroll(buffer_len: usize, screen_rows: usize) -> usize {
     }
 }
 
+fn load_buffer(path: &str) -> Vec<String> {
+    let content = fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    if content.ends_with('\n') {
+        lines.push(String::new());
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 fn read_terminal_size() -> Option<(usize, usize)> {
     // Try ioctl first for accurate size.
     #[cfg(unix)]
@@ -600,6 +657,46 @@ fn unix_winsize() -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_to_line_end_enters_insert_and_moves_cursor() {
+        let mut ed = Editor::open(None, 24);
+        ed.buffer = vec!["hello".to_string()];
+        ed.col = 2;
+        ed.command_append_line_end();
+        assert_eq!(ed.col, 5);
+        assert!(matches!(ed.mode, Mode::Insert));
+        assert_eq!(ed.row, 0);
+    }
+
+    #[test]
+    fn open_line_below_inserts_empty_line_and_positions_cursor() {
+        let mut ed = Editor::open(None, 24);
+        ed.buffer = vec!["aaa".into(), "bbb".into()];
+        ed.row = 0;
+        ed.open_line_below();
+
+        assert_eq!(ed.buffer, vec!["aaa".to_string(), "".to_string(), "bbb".to_string()]);
+        assert_eq!(ed.row, 1);
+        assert_eq!(ed.col, 0);
+        assert!(ed.dirty);
+        assert!(matches!(ed.mode, Mode::Insert));
+        assert_eq!(ed.undo.len(), 1);
+    }
+
+    #[test]
+    fn clamp_cursor_limits_column_to_line_length() {
+        let mut ed = Editor::open(None, 24);
+        ed.buffer = vec!["hi".into()];
+        ed.col = 10;
+        ed.clamp_cursor();
+        assert_eq!(ed.col, 2);
+    }
 }
 
 fn read_key(stdin: &mut StdinLock<'_>) -> Key {
@@ -681,9 +778,87 @@ fn read_key(stdin: &mut StdinLock<'_>) -> Key {
     }
 }
 
+fn parse_args<I: Iterator<Item = String>>(args: I) -> CliConfig {
+    let mut cfg = CliConfig { file: None, print_mode: false, help: false };
+    for arg in args {
+        match arg.as_str() {
+            "-p" | "--print" => cfg.print_mode = true,
+            "-h" | "--help" | "-?" => cfg.help = true,
+            _ if arg.starts_with('-') => {
+                eprintln!("Unknown flag: {arg}");
+            }
+            _ => {
+                if cfg.file.is_none() {
+                    cfg.file = Some(arg);
+                } else {
+                    eprintln!("Ignoring extra argument: {arg}");
+                }
+            }
+        }
+    }
+    cfg
+}
+
+fn print_highlighted(path: &str) -> io::Result<()> {
+    if !Path::new(path).exists() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
+    }
+
+    let content = fs::read_to_string(path)?;
+    let mut buffer: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    if content.ends_with('\n') {
+        buffer.push(String::new());
+    }
+    if buffer.is_empty() {
+        buffer.push(String::new());
+    }
+
+    let full_text = buffer.join("\n");
+    let line_starts = compute_line_starts(&buffer);
+
+    let base_plugin = select_plugin_for_path(path);
+    let mut engine = HighlighterEngine::new(&NEW_REGISTRY, base_plugin);
+    let res = engine.highlight_window(
+        &full_text,
+        WindowReq { start: 0, end: full_text.len() },
+        full_text.len().saturating_add(1024),
+        200_000,
+    );
+
+    ui::render::render_content_lines(
+        &full_text,
+        &buffer,
+        &line_starts,
+        0,
+        buffer.len(),
+        &res.spans,
+        None,
+    );
+    print!("{RESET}");
+    Ok(())
+}
+
 fn main() {
-    let mut args = env::args().skip(1);
-    let file = args.next();
+    let config = parse_args(env::args().skip(1));
+    if config.help {
+        if let Err(e) = print_highlighted("HELP.md") {
+            eprintln!("Failed to show help: {e}");
+        }
+        return;
+    }
+    if config.print_mode {
+        let Some(path) = config.file.as_deref() else {
+            eprintln!("No file provided for --print");
+            process::exit(1);
+        };
+        if let Err(e) = print_highlighted(path) {
+            eprintln!("Failed to print file: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+
+    let file = config.file;
 
     let _raw = match RawModeGuard::new() {
         Ok(g) => g,
@@ -720,6 +895,12 @@ fn main() {
                     Key::Char('i') => {
                         editor.mode = Mode::Insert;
                         editor.status.clear();
+                    }
+                    Key::Char('A') => {
+                        editor.command_append_line_end();
+                    }
+                    Key::Char('o') => {
+                        editor.open_line_below();
                     }
                     Key::Char('v') => {
                         editor.selection_active = true;
@@ -759,6 +940,15 @@ fn main() {
                             editor.row = editor.buffer.len() - 1;
                             editor.col = editor.col.min(editor.buffer[editor.row].len());
                         }
+                        editor.pending_g = false;
+                    }
+                    Key::Home => {
+                        editor.col = 0;
+                        editor.pending_g = false;
+                    }
+                    Key::End => {
+                        editor.clamp_cursor();
+                        editor.col = editor.buffer[editor.row].len();
                         editor.pending_g = false;
                     }
                     Key::Up => {
