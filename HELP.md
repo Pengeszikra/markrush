@@ -11,6 +11,7 @@ md-rush [options] [file]
 ## Options
 
 - `-p`, `--print`  Print the highlighted contents of `file` to stdout and exit (no editor UI).
+- `-c`, `--copy`   Copy entire `file` to the system clipboard and print its first 3 lines.
 - `-h`, `--help`, `-?`  Show this help text.
 
 ## Editor basics
@@ -31,4 +32,3 @@ md-rush [options] [file]
 
 - Uses ANSI escape codes; best in a true-color terminal.
 - Mouse support: requires a terminal that sends SGR mouse events (1006).
-

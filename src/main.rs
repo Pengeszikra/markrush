@@ -77,6 +77,7 @@ struct CliConfig {
     file: Option<String>,
     print_mode: bool,
     help: bool,
+    copy_mode: bool,
 }
 
 struct Editor {
@@ -697,6 +698,12 @@ mod tests {
         ed.clamp_cursor();
         assert_eq!(ed.col, 2);
     }
+
+    #[test]
+    fn copy_file_and_preview_errors_on_missing_file() {
+        let res = copy_file_and_preview("definitely_missing_file_12345.md");
+        assert!(res.is_err());
+    }
 }
 
 fn read_key(stdin: &mut StdinLock<'_>) -> Key {
@@ -779,11 +786,12 @@ fn read_key(stdin: &mut StdinLock<'_>) -> Key {
 }
 
 fn parse_args<I: Iterator<Item = String>>(args: I) -> CliConfig {
-    let mut cfg = CliConfig { file: None, print_mode: false, help: false };
+    let mut cfg = CliConfig { file: None, print_mode: false, help: false, copy_mode: false };
     for arg in args {
         match arg.as_str() {
             "-p" | "--print" => cfg.print_mode = true,
             "-h" | "--help" | "-?" => cfg.help = true,
+            "-c" | "--copy" => cfg.copy_mode = true,
             _ if arg.starts_with('-') => {
                 eprintln!("Unknown flag: {arg}");
             }
@@ -838,11 +846,38 @@ fn print_highlighted(path: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn copy_file_and_preview(path: &str) -> io::Result<()> {
+    if !Path::new(path).exists() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
+    }
+    let content = fs::read_to_string(path)?;
+    copy_to_system(&content);
+
+    for (idx, line) in content.lines().enumerate() {
+        if idx >= 3 {
+            break;
+        }
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn main() {
     let config = parse_args(env::args().skip(1));
     if config.help {
         if let Err(e) = print_highlighted("HELP.md") {
             eprintln!("Failed to show help: {e}");
+        }
+        return;
+    }
+    if config.copy_mode {
+        let Some(path) = config.file.as_deref() else {
+            eprintln!("No file provided for --copy");
+            process::exit(1);
+        };
+        if let Err(e) = copy_file_and_preview(path) {
+            eprintln!("Failed to copy file: {e}");
+            process::exit(1);
         }
         return;
     }
