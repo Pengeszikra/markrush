@@ -1,5 +1,5 @@
 use crate::highlight::span::{Span, StyleId};
-use crate::highlight::state::{PrevClass, State};
+use crate::highlight::state::{PluginId, PrevClass, State};
 use crate::highlight::registry::Registry;
 use crate::highlight::spec::{Guard, StepAction, Trigger};
 
@@ -44,7 +44,16 @@ impl<'a> Stepper<'a> {
             let plugin_id = self.state.current();
             let spec = self.registry.by_id(plugin_id);
 
-            // Entry rules (push embedded languages)
+            // 0) Continue an open comment/string (stateful, window-safe)
+            if let Some(span) = scan_stateful(self.src, self.pos, limit_pos, &mut self.state, plugin_id) {
+                self.pos = span.range.end;
+                spans.push(span);
+                // keep prev as Word-like to avoid accidental ExprStart triggers
+                self.state.prev = PrevClass::Word;
+                continue;
+            }
+
+            // 1) Entry rules (push embedded languages)
             if let Some((span, action)) = try_entry_rules(spec.entry_rules, spec.entry_style, self.src, self.pos, &self.state) {
                 self.pos = span.range.end;
                 spans.push(span);
@@ -52,7 +61,7 @@ impl<'a> Stepper<'a> {
                 continue;
             }
 
-            // Plugin custom scanner
+            // 2) Plugin custom scanner (may push/pop)
             if let Some(scan) = spec.scan_custom {
                 if let Some((span, action)) = scan(self.src, self.pos, &mut self.state) {
                     self.pos = span.range.end;
@@ -62,7 +71,7 @@ impl<'a> Stepper<'a> {
                 }
             }
 
-            // Generic scanners
+            // 3) Whitespace
             if let Some(span) = scan_whitespace(self.src, self.pos) {
                 self.pos = span.range.end;
                 spans.push(span);
@@ -70,20 +79,15 @@ impl<'a> Stepper<'a> {
                 continue;
             }
 
-            if let Some(span) = scan_number(self.src, self.pos) {
+            // 4) Start comment/string (before operators/idents!)
+            if let Some(span) = scan_comment_or_string_start(self.src, self.pos, limit_pos, &mut self.state, plugin_id) {
                 self.pos = span.range.end;
                 spans.push(span);
                 self.state.prev = PrevClass::Word;
                 continue;
             }
 
-            if let Some(span) = scan_ident_or_keyword(self.src, self.pos, spec.keywords) {
-                self.pos = span.range.end;
-                spans.push(span);
-                self.state.prev = PrevClass::Word;
-                continue;
-            }
-
+            // 5) Operators (longest match!)
             if let Some(span) = scan_longest(self.src, self.pos, spec.operators, StyleId::Operator) {
                 self.pos = span.range.end;
                 spans.push(span);
@@ -91,6 +95,13 @@ impl<'a> Stepper<'a> {
                 continue;
             }
 
+            // 6) Punctuation
+            if let Some(span) = scan_longest(self.src, self.pos, spec.punct_mid, StyleId::PunctMid) {
+                self.pos = span.range.end;
+                spans.push(span);
+                self.state.prev = PrevClass::Punct;
+                continue;
+            }
             if let Some(span) = scan_longest(self.src, self.pos, spec.punct_low, StyleId::PunctLow) {
                 self.pos = span.range.end;
                 spans.push(span);
@@ -98,14 +109,23 @@ impl<'a> Stepper<'a> {
                 continue;
             }
 
-            if let Some(span) = scan_longest(self.src, self.pos, spec.punct_mid, StyleId::PunctMid) {
+            // 7) Numbers
+            if let Some(span) = scan_number(self.src, self.pos) {
                 self.pos = span.range.end;
                 spans.push(span);
-                self.state.prev = PrevClass::Punct;
+                self.state.prev = PrevClass::Word;
                 continue;
             }
 
-            // Fallback: consume one UTF-8 char
+            // 8) Ident / Keyword (HTML tag mode uses AttrName)
+            if let Some(span) = scan_ident_or_keyword(self.src, self.pos, spec.keywords, plugin_id) {
+                self.pos = span.range.end;
+                spans.push(span);
+                self.state.prev = PrevClass::Word;
+                continue;
+            }
+
+            // 9) Fallback: consume one UTF-8 char
             let end = next_char_boundary(self.src, self.pos).unwrap_or(self.src.len());
             spans.push(Span { range: self.pos..end, style: StyleId::Text });
             self.pos = end;
@@ -181,7 +201,7 @@ fn scan_number(src: &str, pos: usize) -> Option<Span> {
     Some(Span { range: pos..i, style: StyleId::Number })
 }
 
-fn scan_ident_or_keyword(src: &str, pos: usize, keywords: &[&str]) -> Option<Span> {
+fn scan_ident_or_keyword(src: &str, pos: usize, keywords: &[&str], plugin: PluginId) -> Option<Span> {
     let mut it = src[pos..].char_indices();
     let (_, first) = it.next()?;
     if !(first == '_' || first.is_ascii_alphabetic()) { return None; }
@@ -192,16 +212,142 @@ fn scan_ident_or_keyword(src: &str, pos: usize, keywords: &[&str]) -> Option<Spa
     }
     let slice = &src[pos..end];
     let is_kw = keywords.iter().any(|&k| k == slice);
-    Some(Span { range: pos..end, style: if is_kw { StyleId::Keyword } else { StyleId::Ident } })
+
+    let ident_style = match plugin {
+        PluginId::HtmlTag => StyleId::AttrName,
+        _ => StyleId::Ident,
+    };
+
+    Some(Span { range: pos..end, style: if is_kw { StyleId::Keyword } else { ident_style } })
 }
 
 fn scan_longest(src: &str, pos: usize, list: &[&str], style: StyleId) -> Option<Span> {
+    if pos >= src.len() { return None; }
+    let mut best: Option<&str> = None;
     for pat in list {
         if src[pos..].starts_with(pat) {
-            return Some(Span { range: pos..(pos + pat.len()), style });
+            best = match best {
+                None => Some(*pat),
+                Some(prev) if pat.len() > prev.len() => Some(*pat),
+                _ => best,
+            };
         }
     }
+    best.map(|pat| Span { range: pos..(pos + pat.len()), style })
+}
+
+fn scan_stateful(src: &str, pos: usize, limit_pos: usize, state: &mut State, plugin: PluginId) -> Option<Span> {
+    // Block comment continuation
+    if state.in_block_comment {
+        let end_pat = "*/";
+        let search_end = limit_pos.min(src.len());
+        if let Some(rel) = src[pos..search_end].find(end_pat) {
+            let end = (pos + rel + end_pat.len()).min(search_end);
+            state.in_block_comment = false;
+            return Some(Span { range: pos..end, style: StyleId::Comment });
+        }
+        // not closed in this window
+        return Some(Span { range: pos..search_end, style: StyleId::Comment });
+    }
+
+    // String continuation
+    if let Some(delim) = state.in_string_delim {
+        let search_end = limit_pos.min(src.len());
+        let mut i = pos;
+        let bytes = src.as_bytes();
+        while i < search_end {
+            let b = bytes[i];
+            if b == b'\\' {
+                // skip escaped byte + next byte (best-effort; UTF-8 safe enough for typical code)
+                i = (i + 2).min(search_end);
+                continue;
+            }
+            if b == delim {
+                let end = (i + 1).min(search_end);
+                state.in_string_delim = None;
+                let style = match plugin {
+                    PluginId::HtmlTag => StyleId::AttrValue,
+                    _ => StyleId::String,
+                };
+                return Some(Span { range: pos..end, style });
+            }
+            i += 1;
+        }
+        let style = match plugin {
+            PluginId::HtmlTag => StyleId::AttrValue,
+            _ => StyleId::String,
+        };
+        return Some(Span { range: pos..search_end, style });
+    }
+
     None
+}
+
+fn scan_comment_or_string_start(src: &str, pos: usize, limit_pos: usize, state: &mut State, plugin: PluginId) -> Option<Span> {
+    let search_end = limit_pos.min(src.len());
+
+    // JS / Rust: // line comment
+    if matches!(plugin, PluginId::Js | PluginId::Rust) && src[pos..].starts_with("//") {
+        let line_end = src[pos..search_end].find('\n').map(|n| pos + n).unwrap_or(search_end);
+        return Some(Span { range: pos..line_end, style: StyleId::Comment });
+    }
+
+    // Bash: # line comment
+    if matches!(plugin, PluginId::Bash) && src.as_bytes().get(pos).copied() == Some(b'#') {
+        let line_end = src[pos..search_end].find('\n').map(|n| pos + n).unwrap_or(search_end);
+        return Some(Span { range: pos..line_end, style: StyleId::Comment });
+    }
+
+    // JS / Rust: /* block comment */
+    if matches!(plugin, PluginId::Js | PluginId::Rust) && src[pos..].starts_with("/*") {
+        if let Some(rel) = src[pos..search_end].find("*/") {
+            let end = (pos + rel + 2).min(search_end);
+            return Some(Span { range: pos..end, style: StyleId::Comment });
+        }
+        state.in_block_comment = true;
+        return Some(Span { range: pos..search_end, style: StyleId::Comment });
+    }
+
+    // Strings:
+    // - JS: ', ", `
+    // - Rust: ", ' (char treated as string-ish here)
+    // - HTML tag: quoted attribute values
+    let b = src.as_bytes().get(pos).copied()?;
+    let is_string_start = match plugin {
+        PluginId::Js => matches!(b, b'\'' | b'"' | b'`'),
+        PluginId::Rust => matches!(b, b'\'' | b'"'),
+        PluginId::HtmlTag => matches!(b, b'\'' | b'"'),
+        _ => false,
+    };
+    if !is_string_start { return None; }
+
+    let delim = b;
+    let mut i = pos + 1;
+    let bytes = src.as_bytes();
+    while i < search_end {
+        let bb = bytes[i];
+        if bb == b'\\' {
+            i = (i + 2).min(search_end);
+            continue;
+        }
+        if bb == delim {
+            let end = (i + 1).min(search_end);
+            let style = match plugin {
+                PluginId::HtmlTag => StyleId::AttrValue,
+                _ => StyleId::String,
+            };
+            return Some(Span { range: pos..end, style });
+        }
+        i += 1;
+    }
+
+    // not closed
+    state.in_string_delim = Some(delim);
+    let style = match plugin {
+        PluginId::HtmlTag => StyleId::AttrValue,
+        _ => StyleId::String,
+    };
+    Some(Span { range: pos..search_end, style })
 }
 
 fn next_char_boundary(src: &str, pos: usize) -> Option<usize> {

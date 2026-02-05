@@ -56,8 +56,11 @@ language_plugin! {
         { child: HtmlText, trigger: Prefix("```html"), guard: AtLineStart },
         { child: Bash, trigger: Prefix("```bash"), guard: AtLineStart },
         { child: Bash, trigger: Prefix("```sh"), guard: AtLineStart },
+        { child: Rust, trigger: Prefix("```rust"), guard: AtLineStart },
+        { child: Rust, trigger: Prefix("```rs"), guard: AtLineStart },
     ],
 
     entry_style: MdFence,
     scan_custom: Some(scan_markdown_custom)
 }
+
