@@ -54,6 +54,8 @@ language_plugin! {
         { child: Js, trigger: Prefix("```js"), guard: AtLineStart },
         { child: Js, trigger: Prefix("```javascript"), guard: AtLineStart },
         { child: HtmlText, trigger: Prefix("```html"), guard: AtLineStart },
+        { child: Rust, trigger: Prefix("```rust"), guard: AtLineStart },
+        { child: Rust, trigger: Prefix("```rs"), guard: AtLineStart },
         { child: Bash, trigger: Prefix("```bash"), guard: AtLineStart },
         { child: Bash, trigger: Prefix("```sh"), guard: AtLineStart },
     ],

@@ -7,6 +7,7 @@ pub enum PluginId {
     HtmlText,
     HtmlTag,
     Bash,
+    Rust,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

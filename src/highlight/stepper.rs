@@ -1,5 +1,5 @@
 use crate::highlight::span::{Span, StyleId};
-use crate::highlight::state::{PrevClass, State};
+use crate::highlight::state::{PrevClass, State, PluginId};
 use crate::highlight::registry::Registry;
 use crate::highlight::spec::{Guard, StepAction, Trigger};
 
@@ -44,6 +44,17 @@ impl<'a> Stepper<'a> {
             let plugin_id = self.state.current();
             let spec = self.registry.by_id(plugin_id);
 
+            // HTML comments in text mode
+            if plugin_id == PluginId::HtmlText && self.src[self.pos..].starts_with("<!--") {
+                let end_rel = self.src[self.pos..limit_pos].find("-->").map(|i| i + 3).unwrap_or(limit_pos - self.pos);
+                let end = self.pos + end_rel;
+                let span = Span { range: self.pos..end, style: StyleId::Comment };
+                self.pos = end;
+                spans.push(span);
+                self.state.prev = PrevClass::Space;
+                continue;
+            }
+
             // Entry rules (push embedded languages)
             if let Some((span, action)) = try_entry_rules(spec.entry_rules, spec.entry_style, self.src, self.pos, &self.state) {
                 self.pos = span.range.end;
@@ -77,10 +88,41 @@ impl<'a> Stepper<'a> {
                 continue;
             }
 
-            if let Some(span) = scan_ident_or_keyword(self.src, self.pos, spec.keywords) {
+            if let Some(mut span) = scan_ident_or_keyword(self.src, self.pos, spec.keywords) {
+                if plugin_id == PluginId::Rust {
+                    if let Some(b'!') = self.src.as_bytes().get(span.range.end) {
+                        if self.src.as_bytes().get(span.range.end + 1) != Some(&b'=') {
+                            span.style = StyleId::Keyword;
+                        }
+                    }
+                }
                 self.pos = span.range.end;
                 spans.push(span);
                 self.state.prev = PrevClass::Word;
+                continue;
+            }
+
+            // JS block comments with JSDoc tags
+            if plugin_id == PluginId::Js && self.src[self.pos..].starts_with("/*") {
+                let is_jsdoc = self.src[self.pos..].starts_with("/**");
+                let max_slice = &self.src[self.pos..limit_pos];
+                let end_rel = max_slice.find("*/").map(|i| i + 2).unwrap_or(max_slice.len());
+                let end = self.pos + end_rel;
+                if is_jsdoc {
+                    spans.extend(scan_jsdoc_comment(self.src, self.pos, end));
+                } else {
+                    spans.push(Span { range: self.pos..end, style: StyleId::Comment });
+                }
+                self.pos = end;
+                self.state.prev = PrevClass::Space;
+                continue;
+            }
+
+            if plugin_id == PluginId::Js && self.src[self.pos..].starts_with("//") {
+                let end = self.src[self.pos..limit_pos].find('\n').map(|i| self.pos + i).unwrap_or(limit_pos);
+                spans.push(Span { range: self.pos..end, style: StyleId::Comment });
+                self.pos = end;
+                self.state.prev = PrevClass::Space;
                 continue;
             }
 
@@ -218,3 +260,37 @@ fn contains_newline(src: &str, range: &core::ops::Range<usize>) -> bool {
     src[range.clone()].as_bytes().iter().any(|&b| b == b'\n')
 }
 
+fn scan_jsdoc_comment(src: &str, start: usize, end: usize) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut cursor = start;
+    let bytes = src.as_bytes();
+    let mut i = start;
+
+    while i < end {
+        if bytes[i] == b'@' {
+            let mut j = i + 1;
+            while j < end && is_ident_continue_byte(bytes[j]) {
+                j += 1;
+            }
+            if j > i + 1 {
+                if cursor < i {
+                    spans.push(Span { range: cursor..i, style: StyleId::Comment });
+                }
+                spans.push(Span { range: i..j, style: StyleId::Keyword });
+                cursor = j;
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    if cursor < end {
+        spans.push(Span { range: cursor..end, style: StyleId::Comment });
+    }
+    spans
+}
+
+fn is_ident_continue_byte(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
+}

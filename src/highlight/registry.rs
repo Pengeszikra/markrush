@@ -7,6 +7,7 @@ pub struct Registry {
     pub html_text: &'static PluginSpec,
     pub html_tag: &'static PluginSpec,
     pub bash: &'static PluginSpec,
+    pub rust: &'static PluginSpec,
 }
 
 impl Registry {
@@ -17,11 +18,12 @@ impl Registry {
             PluginId::HtmlText => self.html_text,
             PluginId::HtmlTag => self.html_tag,
             PluginId::Bash => self.bash,
+            PluginId::Rust => self.rust,
         }
     }
 }
 
-use crate::highlight::plugins::{Bash, HtmlTag, HtmlText, Js, Markdown};
+use crate::highlight::plugins::{Bash, HtmlTag, HtmlText, Js, Markdown, Rust};
 
 pub const REGISTRY: Registry = Registry {
     markdown: &Markdown,
@@ -29,4 +31,5 @@ pub const REGISTRY: Registry = Registry {
     html_text: &HtmlText,
     html_tag: &HtmlTag,
     bash: &Bash,
+    rust: &Rust,
 };

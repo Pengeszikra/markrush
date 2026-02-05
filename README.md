@@ -1,4 +1,5 @@
 # markrush is a minimal CLI code editor
+caro build under 2sec.
 
 ```html
 <div>hello</div>

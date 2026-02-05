@@ -15,6 +15,9 @@ use std::{
 };
 
 const RESET: &str = "\u{1b}[0m";
+const HIGHLIGHT_BUDGET_BYTES: usize = 512 * 1024;
+const HIGHLIGHT_BUDGET_SPANS: usize = 200_000;
+const IDLE_BUDGET_BYTES: usize = 256 * 1024;
 
 struct RawModeGuard;
 
@@ -58,7 +61,7 @@ enum Key {
     Unknown,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum Mode {
     Normal,
     Insert,
@@ -71,6 +74,42 @@ struct Snapshot {
     row: usize,
     col: usize,
     dirty: bool,
+    buffer_revision: u64,
+}
+
+#[derive(Clone, PartialEq)]
+struct UiState {
+    row: usize,
+    col: usize,
+    scroll: usize,
+    mode: Mode,
+    selection_active: bool,
+    sel_start_row: usize,
+    sel_start_col: usize,
+    command: String,
+    status: String,
+    dirty: bool,
+    buffer_revision: u64,
+    screen_rows: usize,
+}
+
+impl From<&Editor> for UiState {
+    fn from(ed: &Editor) -> Self {
+        Self {
+            row: ed.row,
+            col: ed.col,
+            scroll: ed.scroll,
+            mode: ed.mode,
+            selection_active: ed.selection_active,
+            sel_start_row: ed.sel_start_row,
+            sel_start_col: ed.sel_start_col,
+            command: ed.command.clone(),
+            status: ed.status.clone(),
+            dirty: ed.dirty,
+            buffer_revision: ed.buffer_revision,
+            screen_rows: ed.screen_rows,
+        }
+    }
 }
 
 struct CliConfig {
@@ -110,6 +149,14 @@ struct Editor {
     base_plugin: NewPluginId,
 
     last_new_spans: Vec<NewSpan>,
+
+    buffer_revision: u64,
+    last_highlight_revision: u64,
+    last_highlight_window: Option<WindowReq>,
+    last_highlight_screen_rows: usize,
+    last_highlight_quality_exact: bool,
+    last_highlight_mode: Mode,
+    last_highlight_selection_active: bool,
 }
 
 impl Editor {
@@ -155,6 +202,14 @@ impl Editor {
             last_new_span_count: 0,
             base_plugin,
             last_new_spans: Vec::new(),
+
+            buffer_revision: 0,
+            last_highlight_revision: u64::MAX,
+            last_highlight_window: None,
+            last_highlight_screen_rows: screen_rows,
+            last_highlight_quality_exact: false,
+            last_highlight_mode: Mode::Normal,
+            last_highlight_selection_active: false,
         }
     }
 
@@ -202,19 +257,17 @@ impl Editor {
         }
     }
 
-    fn refresh_terminal_rows(&mut self) {
+    fn refresh_terminal_rows(&mut self) -> bool {
         let rows = read_terminal_size().map(|(r, _)| r).unwrap_or(24);
-        self.screen_rows = rows.max(3);
+        let normalized = rows.max(3);
+        let changed = normalized != self.screen_rows;
+        self.screen_rows = normalized;
+        changed
     }
 
-    fn run_new_highlighter(&mut self, full_text: &str, line_starts: &[usize], content_rows: usize) {
-        if !self.use_new_highlighter {
-            return;
-        }
+    fn window_request(&self, line_starts: &[usize], content_rows: usize, full_len: usize) -> Option<WindowReq> {
         if self.buffer.is_empty() {
-            self.last_new_span_count = 0;
-            self.last_new_spans.clear();
-            return;
+            return None;
         }
 
         let start_line = self.scroll.min(self.buffer.len().saturating_sub(1));
@@ -224,26 +277,69 @@ impl Editor {
         let window_end = if end_line + 1 < line_starts.len() {
             line_starts[end_line + 1]
         } else {
-            full_text.len()
+            full_len
         };
+
+        Some(WindowReq { start: window_start, end: window_end })
+    }
+
+    fn sync_highlighter_revision(&mut self) {
+        self.highlight_engine.set_revision(self.buffer_revision, self.base_plugin);
+    }
+
+    fn update_highlighting(&mut self, full_text: &str, line_starts: &[usize], content_rows: usize) {
+        if !self.use_new_highlighter {
+            self.last_new_span_count = 0;
+            self.last_new_spans.clear();
+            self.last_highlight_window = None;
+            self.last_highlight_quality_exact = true;
+            return;
+        }
+
+        let Some(window) = self.window_request(line_starts, content_rows, full_text.len()) else {
+            self.last_new_span_count = 0;
+            self.last_new_spans.clear();
+            self.last_highlight_window = None;
+            self.last_highlight_quality_exact = true;
+            return;
+        };
+
+        let needs_highlight = self.last_highlight_window != Some(window)
+            || self.last_highlight_revision != self.buffer_revision
+            || self.last_highlight_screen_rows != self.screen_rows
+            || self.last_highlight_mode != self.mode
+            || self.last_highlight_selection_active != self.selection_active;
+
+        if !needs_highlight {
+            return;
+        }
+
+        self.sync_highlighter_revision();
 
         let res = self.highlight_engine.highlight_window(
             full_text,
-            WindowReq { start: window_start, end: window_end },
-            128 * 1024,
-            50_000,
+            window,
+            HIGHLIGHT_BUDGET_BYTES,
+            HIGHLIGHT_BUDGET_SPANS,
         );
 
+        self.last_highlight_window = Some(window);
+        self.last_highlight_revision = self.buffer_revision;
+        self.last_highlight_screen_rows = self.screen_rows;
+        self.last_highlight_mode = self.mode;
+        self.last_highlight_selection_active = self.selection_active;
+        self.last_highlight_quality_exact = res.quality_exact;
         self.last_new_span_count = res.spans.len();
         self.last_new_spans = res.spans;
+    }
 
-        // Intentionally disabled in this refactor pass:
-        // keep highlight correctness development isolated from background work scheduling.
-        // self.highlight_engine.do_idle_work(full_text, 256 * 1024);
+    fn mark_edited(&mut self) {
+        self.buffer_revision = self.buffer_revision.wrapping_add(1);
+        self.highlight_engine.set_revision(self.buffer_revision, self.base_plugin);
+        self.last_highlight_window = None;
     }
 
     fn render(&mut self) {
-        self.refresh_terminal_rows();
         print!("\x1b[2J\x1b[H"); // clear screen
 
         let content_rows = self.screen_rows.saturating_sub(1);
@@ -261,12 +357,7 @@ impl Editor {
                 (start, end)
             });
 
-        if self.use_new_highlighter {
-            self.run_new_highlighter(&full_text, &line_starts, content_rows);
-        } else {
-            self.last_new_span_count = 0;
-            self.last_new_spans.clear();
-        }
+        self.update_highlighting(&full_text, &line_starts, content_rows);
 
         ui::render::render_content_lines(
             &full_text,
@@ -298,13 +389,14 @@ impl Editor {
 
         let status_row = content_rows + 1;
         print!(
-            "\x1b[{};1H\x1b[2K\x1b[7m{} | {} | line {} col {} | spans {}{}\x1b[0m",
+            "\x1b[{};1H\x1b[2K\x1b[7m{} | {} | line {} col {} | spans {}{}{}\x1b[0m",
             status_row,
             mode_label,
             status_text,
             self.row + 1,
             self.col + 1,
             self.last_new_span_count,
+            if self.last_highlight_quality_exact { "" } else { " (~)" },
             if self.dirty { " [+]" } else { "" }
         );
 
@@ -330,6 +422,7 @@ impl Editor {
         line.insert(insert_at, c);
         self.col += c.len_utf8();
         self.dirty = true;
+        self.mark_edited();
     }
 
     fn insert_newline(&mut self) {
@@ -338,6 +431,7 @@ impl Editor {
             self.row = self.buffer.len() - 1;
             self.col = 0;
             self.dirty = true;
+            self.mark_edited();
             return;
         }
 
@@ -350,6 +444,7 @@ impl Editor {
         self.row += 1;
         self.col = 0;
         self.dirty = true;
+        self.mark_edited();
     }
 
     fn backspace(&mut self) {
@@ -367,6 +462,7 @@ impl Editor {
                 line.replace_range(start..remove_at, "");
                 self.col = self.col.saturating_sub(prev_len);
                 self.dirty = true;
+                self.mark_edited();
             }
             return;
         }
@@ -379,6 +475,7 @@ impl Editor {
             line.push_str(&current);
             self.col = old_len;
             self.dirty = true;
+            self.mark_edited();
         }
     }
 
@@ -407,6 +504,7 @@ impl Editor {
         self.mode = Mode::Insert;
         self.dirty = true;
         self.status.clear();
+        self.mark_edited();
     }
 
     fn save_snapshot(&mut self) {
@@ -415,6 +513,7 @@ impl Editor {
             row: self.row,
             col: self.col,
             dirty: self.dirty,
+            buffer_revision: self.buffer_revision,
         });
         if self.undo.len() > 100 {
             self.undo.remove(0);
@@ -428,6 +527,8 @@ impl Editor {
             self.col = s.col;
             self.dirty = s.dirty;
             self.ensure_cursor_visible();
+            self.buffer_revision = self.buffer_revision.max(s.buffer_revision);
+            self.mark_edited();
         }
     }
 
@@ -616,6 +717,7 @@ fn select_plugin_for_path(path: &str) -> NewPluginId {
         Some("js") | Some("mjs") | Some("cjs") => NewPluginId::Js,
         Some("html") | Some("htm") => NewPluginId::HtmlText,
         Some("sh") | Some("bash") => NewPluginId::Bash,
+        Some("rs") => NewPluginId::Rust,
         Some("rush") | Some("md") | Some("markdown") => NewPluginId::Markdown,
         _ => NewPluginId::Markdown,
     }
@@ -664,6 +766,7 @@ fn unix_winsize() -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::highlight::{HighlighterEngine, REGISTRY, WindowReq, PluginId, Span, StyleId};
 
     #[test]
     fn append_to_line_end_enters_insert_and_moves_cursor() {
@@ -704,6 +807,39 @@ mod tests {
     fn copy_file_and_preview_errors_on_missing_file() {
         let res = copy_file_and_preview("definitely_missing_file_12345.md");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn html_comment_in_fence_is_comment() {
+        let src = "```html\n<!-- x -->\n```";
+        let spans = highlight(src);
+        assert!(spans.iter().any(|s| s.style == StyleId::Comment && &src[s.range.clone()] == "<!-- x -->"));
+    }
+
+    #[test]
+    fn rust_macro_ident_is_keyword() {
+        let src = "```rust\nprint!()\n```";
+        let spans = highlight(src);
+        assert!(spans.iter().any(|s| s.style == StyleId::Keyword && &src[s.range.clone()] == "print"));
+    }
+
+    #[test]
+    fn jsdoc_tag_is_keyword_inside_comment() {
+        let src = "```js\n/** @type {number} */\n```";
+        let spans = highlight(src);
+        assert!(spans.iter().any(|s| s.style == StyleId::Keyword && &src[s.range.clone()] == "@type"));
+        assert!(spans.iter().any(|s| s.style == StyleId::Comment));
+    }
+
+    fn highlight(src: &str) -> Vec<Span> {
+        let mut engine = HighlighterEngine::new(&REGISTRY, PluginId::Markdown);
+        let res = engine.highlight_window(
+            src,
+            WindowReq { start: 0, end: src.len() },
+            src.len().saturating_add(1024),
+            200_000,
+        );
+        res.spans
     }
 }
 
@@ -908,17 +1044,32 @@ fn main() {
     let mut needs_render = true;
 
     loop {
+        let resized = editor.refresh_terminal_rows();
+        if resized {
+            needs_render = true;
+        }
+
+        let mut rendered_this_iter = false;
+
         if needs_render {
             editor.ensure_cursor_visible();
             editor.render();
             needs_render = false;
+            rendered_this_iter = true;
         }
 
+        let before_state = UiState::from(&editor);
         let key = read_key(&mut stdin);
         if matches!(key, Key::Unknown) {
+            if editor.use_new_highlighter && !editor.buffer.is_empty() {
+                let full_text = editor.buffer.join("\n");
+                editor.sync_highlighter_revision();
+                editor.highlight_engine.do_idle_work(&full_text, IDLE_BUDGET_BYTES);
+            }
             continue;
         }
-        needs_render = true;
+
+        let mut should_quit = false;
 
         match editor.mode {
             Mode::Normal => {
@@ -926,6 +1077,7 @@ fn main() {
                     Key::Char('i') => {
                         editor.mode = Mode::Insert;
                         editor.status.clear();
+                        editor.pending_g = false;
                     }
                     Key::Char('A') => {
                         editor.command_append_line_end();
@@ -938,6 +1090,7 @@ fn main() {
                         editor.sel_start_row = editor.row;
                         editor.sel_start_col = editor.col;
                         editor.status = "Visual mode".to_string();
+                        editor.pending_g = false;
                     }
                     Key::Char('y') => {
                         if editor.selection_active {
@@ -946,16 +1099,20 @@ fn main() {
                         } else {
                             editor.status = "No selection".to_string();
                         }
+                        editor.pending_g = false;
                     }
                     Key::Char('p') => {
                         editor.paste_clipboard();
+                        editor.pending_g = false;
                     }
                     Key::Char('u') => {
                         editor.undo();
+                        editor.pending_g = false;
                     }
                     Key::Char(':') => {
                         editor.mode = Mode::Command;
                         editor.command.clear();
+                        editor.pending_g = false;
                     }
                     Key::LittleG => {
                         if editor.pending_g {
@@ -1012,6 +1169,7 @@ fn main() {
                         if editor.scroll > max_scroll {
                             editor.scroll = max_scroll;
                         }
+                        editor.pending_g = false;
                     }
                     Key::WheelDown => {
                         let content_rows = editor.screen_rows.saturating_sub(1);
@@ -1024,10 +1182,12 @@ fn main() {
                         if content_rows > 0 {
                             editor.scroll = (editor.scroll + 3).min(max_scroll);
                         }
+                        editor.pending_g = false;
                     }
                     Key::Esc => {
                         editor.selection_active = false;
                         editor.pending_g = false;
+                        editor.status.clear();
                     }
                     _ => {
                         editor.pending_g = false;
@@ -1062,14 +1222,11 @@ fn main() {
                         editor.command.clear();
                     }
                     Key::Enter => {
-                        let should_quit = editor.apply_command();
+                        let quit_now = editor.apply_command();
                         editor.mode = Mode::Normal;
-                        if should_quit {
-                            print!("\x1b[2J\x1b[H");
-                            let _ = io::stdout().flush();
-                            break;
+                        if quit_now {
+                            should_quit = true;
                         }
-                        needs_render = true;
                     }
                     Key::Backspace => {
                         editor.command.pop();
@@ -1080,6 +1237,17 @@ fn main() {
                     _ => {}
                 }
             }
+        }
+
+        if should_quit {
+            print!("\x1b[2J\x1b[H");
+            let _ = io::stdout().flush();
+            break;
+        }
+
+        let after_state = UiState::from(&editor);
+        if after_state != before_state || (resized && !rendered_this_iter) {
+            needs_render = true;
         }
     }
 

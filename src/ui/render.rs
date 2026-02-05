@@ -151,6 +151,8 @@ pub fn render_content_lines(
     spans: &[Span],
     selection_abs: Option<(usize, usize)>,
 ) {
+    let merged_spans = merge_adjacent_spans(spans);
+    let spans = merged_spans.as_slice();
     let mut span_idx = 0usize;
 
     for row in 0..content_rows {
@@ -209,4 +211,21 @@ pub fn render_content_lines(
 
         span_idx = local_idx;
     }
+}
+
+fn merge_adjacent_spans(spans: &[Span]) -> Vec<Span> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Span> = Vec::with_capacity(spans.len());
+    for sp in spans {
+        if let Some(last) = out.last_mut() {
+            if last.style == sp.style && last.range.end == sp.range.start {
+                last.range.end = sp.range.end;
+                continue;
+            }
+        }
+        out.push(sp.clone());
+    }
+    out
 }

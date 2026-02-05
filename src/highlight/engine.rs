@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
 use crate::highlight::span::Span;
-use crate::highlight::state::State;
+use crate::highlight::state::{State, PluginId};
 use crate::highlight::registry::Registry;
 use crate::highlight::stepper::{Stepper, StopReason};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowReq {
     pub start: usize,
     pub end: usize,
@@ -32,11 +32,12 @@ pub struct HighlighterEngine<'a> {
     pub root_plugin: crate::highlight::state::PluginId,
     pub checkpoints: Vec<Checkpoint>,
     pub work_queue: Vec<WorkItem>,
+    pub revision: u64,
 }
 
 impl<'a> HighlighterEngine<'a> {
     pub fn new(registry: &'a Registry, root_plugin: crate::highlight::state::PluginId) -> Self {
-        Self { registry, root_plugin, checkpoints: Vec::new(), work_queue: Vec::new() }
+        Self { registry, root_plugin, checkpoints: Vec::new(), work_queue: Vec::new(), revision: 0 }
     }
 
     pub fn highlight_window(&mut self, src: &str, window: WindowReq, budget_bytes: usize, budget_spans: usize) -> WindowResult {
@@ -125,6 +126,19 @@ impl<'a> HighlighterEngine<'a> {
         }
     }
 
+    pub fn set_revision(&mut self, revision: u64, root_plugin: PluginId) {
+        if self.revision != revision {
+            self.reset(root_plugin);
+            self.revision = revision;
+        }
+    }
+
+    pub fn reset(&mut self, root_plugin: PluginId) {
+        self.root_plugin = root_plugin;
+        self.checkpoints.clear();
+        self.work_queue.clear();
+    }
+
     fn find_anchor(&self, target_offset: usize) -> Option<(usize, State)> {
         // Replace with binary search later; linear is fine for skeleton.
         let mut best: Option<&Checkpoint> = None;
@@ -151,5 +165,44 @@ impl<'a> HighlighterEngine<'a> {
         } else {
             self.checkpoints.insert(i, Checkpoint { offset, state });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::highlight::{REGISTRY, PluginId};
+
+    #[test]
+    fn idle_work_handles_large_sources_without_redraws() {
+        let mut engine = HighlighterEngine::new(&REGISTRY, PluginId::Js);
+        let src = "function demo() { return 1; }\n".repeat(4_000);
+
+        let res = engine.highlight_window(
+            &src,
+            WindowReq { start: 0, end: src.len() },
+            256,
+            8,
+        );
+        assert!(!res.quality_exact);
+
+        engine.schedule_checkpoint_build(0, src.len());
+        engine.do_idle_work(&src, 32 * 1024);
+        assert!(engine.checkpoints.len() > 0 || engine.work_queue.is_empty());
+    }
+
+    #[test]
+    fn revision_reset_clears_cached_checkpoints() {
+        let mut engine = HighlighterEngine::new(&REGISTRY, PluginId::Markdown);
+        let src = "x".repeat(2_048);
+
+        engine.schedule_checkpoint_build(0, src.len());
+        engine.do_idle_work(&src, 8 * 1024);
+        assert!(!engine.checkpoints.is_empty());
+
+        engine.set_revision(42, PluginId::Markdown);
+        assert!(engine.checkpoints.is_empty());
+        assert!(engine.work_queue.is_empty());
+        assert_eq!(engine.revision, 42);
     }
 }
