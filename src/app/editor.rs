@@ -642,12 +642,6 @@ impl Editor {
                     Key::Char(c) => {
                         self.command.push(c);
                     }
-                    Key::LittleG => {
-                        self.command.push('g');
-                    }
-                    Key::G => {
-                        self.command.push('G');
-                    }
                     _ => {}
                 }
             }

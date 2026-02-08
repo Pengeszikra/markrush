@@ -1249,6 +1249,14 @@ fn main() {
                         editor.save_snapshot();
                         editor.insert_char(c);
                     }
+                    Key::LittleG => {
+                        editor.save_snapshot();
+                        editor.insert_char('g');
+                    }
+                    Key::G => {
+                        editor.save_snapshot();
+                        editor.insert_char('G');
+                    }
                     _ => {}
                 }
             }

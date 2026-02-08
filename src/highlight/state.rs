@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use crate::highlight::js_lexer::JsMode;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluginId {
     Markdown,
@@ -29,6 +31,7 @@ pub struct State {
 
     pub in_block_comment: bool,
     pub in_string_delim: Option<u8>,
+    pub js_mode: JsMode,
 }
 
 impl State {
@@ -44,6 +47,7 @@ impl State {
             prev: PrevClass::None,
             in_block_comment: false,
             in_string_delim: None,
+            js_mode: JsMode::Normal,
         }
     }
 

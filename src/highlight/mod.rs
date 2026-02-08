@@ -9,6 +9,7 @@ pub mod stepper;
 pub mod engine;
 pub mod plugins;
 pub mod langue_plugin;
+pub mod js_lexer;
 
 pub use span::{Span, StyleId};
 pub use state::{PluginId, PrevClass, State};

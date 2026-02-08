@@ -3,6 +3,7 @@ use crate::highlight::state::{PrevClass, State, PluginId};
 use crate::highlight::registry::Registry;
 use crate::highlight::spec::{Guard, StepAction, Trigger};
 use crate::highlight::spec::PluginSpec;
+use crate::highlight::js_lexer::{JsMode, lex_js_window, tokens_to_spans};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
@@ -64,6 +65,39 @@ impl<'a> Stepper<'a> {
 
             let plugin_id = self.state.current();
             let spec = self.registry.by_id(plugin_id);
+
+            if plugin_id == PluginId::Js {
+                if let Some(scan) = spec.scan_custom {
+                    if let Some((span, action)) = scan(self.src, self.pos, limit_pos, &mut self.state) {
+                        self.pos = span.range.end;
+                        spans.push(span);
+                        apply_action(&mut self.state, action);
+                        continue;
+                    }
+                }
+                let (tokens, mode_out) = lex_js_window(self.src, self.pos, limit_pos, self.state.js_mode);
+                let js_spans = tokens_to_spans(&tokens, self.src);
+                for sp in js_spans {
+                    if spans.len() >= max_spans || (sp.range.end - start_pos) >= max_bytes {
+                        return StepResult { spans, stop: StopReason::BudgetExhausted, pos: self.pos, state: self.state.clone() };
+                    }
+                    spans.push(sp.clone());
+                }
+                if let Some(last) = tokens.last() {
+                    self.pos = last.end;
+                    self.state.prev = match last.kind {
+                        crate::highlight::js_lexer::JsTokenKind::Whitespace => PrevClass::Space,
+                        crate::highlight::js_lexer::JsTokenKind::Comment => PrevClass::Space,
+                        crate::highlight::js_lexer::JsTokenKind::Symbol => PrevClass::Operator,
+                        _ => PrevClass::Word,
+                    };
+                } else {
+                    self.pos = limit_pos;
+                }
+                self.state.js_mode = mode_out;
+                continue;
+            }
+
             let cache_ptr = self.cache_for(spec, plugin_id);
             let cache = unsafe { &*cache_ptr };
 
@@ -122,21 +156,6 @@ impl<'a> Stepper<'a> {
                 self.pos = span.range.end;
                 spans.push(span);
                 self.state.prev = PrevClass::Word;
-                continue;
-            }
-
-            if plugin_id == PluginId::Js && self.src[self.pos..].starts_with("/**") {
-                let max_slice = &self.src[self.pos..limit_pos];
-                let end_rel = max_slice.find("*/").map(|i| i + 2).unwrap_or(max_slice.len());
-                let end = self.pos + end_rel;
-                spans.extend(scan_jsdoc_comment(self.src, self.pos, end));
-                if end_rel == max_slice.len() && !max_slice.ends_with("*/") {
-                    self.state.in_block_comment = true;
-                } else {
-                    self.state.in_block_comment = false;
-                }
-                self.pos = end;
-                self.state.prev = PrevClass::Space;
                 continue;
             }
 
@@ -353,39 +372,4 @@ fn is_line_start(src: &str, pos: usize) -> bool {
 
 fn contains_newline(src: &str, range: &core::ops::Range<usize>) -> bool {
     src[range.clone()].as_bytes().iter().any(|&b| b == b'\n')
-}
-
-fn scan_jsdoc_comment(src: &str, start: usize, end: usize) -> Vec<Span> {
-    let mut spans = Vec::new();
-    let mut cursor = start;
-    let bytes = src.as_bytes();
-    let mut i = start;
-
-    while i < end {
-        if bytes[i] == b'@' {
-            let mut j = i + 1;
-            while j < end && is_ident_continue_byte(bytes[j]) {
-                j += 1;
-            }
-            if j > i + 1 {
-                if cursor < i {
-                    spans.push(Span { range: cursor..i, style: StyleId::Comment });
-                }
-                spans.push(Span { range: i..j, style: StyleId::Keyword });
-                cursor = j;
-                i = j;
-                continue;
-            }
-        }
-        i += 1;
-    }
-
-    if cursor < end {
-        spans.push(Span { range: cursor..end, style: StyleId::Comment });
-    }
-    spans
-}
-
-fn is_ident_continue_byte(b: u8) -> bool {
-    b == b'_' || b.is_ascii_alphanumeric()
 }
