@@ -23,7 +23,6 @@ pub fn read_key(stdin: &mut StdinLock<'_>) -> Key {
                 b'H' => return Key::Home,
                 b'F' => return Key::End,
                 b'<' => {
-                    // SGR mouse (enabled via 1006h). Keep reading until the final M/m.
                     let mut seq = Vec::from(&buf[..n]);
                     while !seq.ends_with(b"M") && !seq.ends_with(b"m") {
                         let mut tmp = [0u8; 16];
@@ -32,7 +31,7 @@ pub fn read_key(stdin: &mut StdinLock<'_>) -> Key {
                             Ok(m) => seq.extend_from_slice(&tmp[..m]),
                         }
                         if seq.len() > 32 {
-                            break; // avoid runaway on malformed data
+                            break;
                         }
                     }
                     if seq.len() >= 6 {

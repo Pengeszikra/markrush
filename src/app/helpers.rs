@@ -1,9 +1,11 @@
 use std::fs;
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::io::{self, Write};
 
-use crate::highlight::PluginId as NewPluginId;
+use crate::highlight::{HighlighterEngine, REGISTRY as NEW_REGISTRY, WindowReq, PluginId as NewPluginId};
+use crate::ui;
+use crate::r#struct::RESET;
 
 pub fn copy_to_system(text: &str) {
     if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
@@ -61,7 +63,6 @@ pub fn load_buffer(path: &str) -> Vec<String> {
 }
 
 pub fn read_terminal_size() -> Option<(usize, usize)> {
-    // Try ioctl first for accurate size.
     #[cfg(unix)]
     {
         if let Some(ws) = unix_winsize() {
@@ -69,7 +70,6 @@ pub fn read_terminal_size() -> Option<(usize, usize)> {
         }
     }
 
-    // Fallback to `stty size`.
     if let Ok(out) = Command::new("stty").arg("size").output() {
         if let Ok(s) = String::from_utf8(out.stdout) {
             let mut parts = s.split_whitespace();
@@ -101,10 +101,6 @@ pub fn select_plugin_for_path(path: &str) -> NewPluginId {
 }
 
 pub fn print_highlighted(path: &str) -> io::Result<()> {
-    use crate::highlight::HighlighterEngine;
-    use crate::highlight::{REGISTRY as NEW_REGISTRY, WindowReq};
-    use crate::ui;
-
     if !Path::new(path).exists() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
     }
@@ -123,13 +119,15 @@ pub fn print_highlighted(path: &str) -> io::Result<()> {
 
     let base_plugin = select_plugin_for_path(path);
     let mut engine = HighlighterEngine::new(&NEW_REGISTRY, base_plugin);
-    let res = engine.highlight_window(
+    let res = engine.highlight_window_full(
         &full_text,
         WindowReq { start: 0, end: full_text.len() },
         full_text.len().saturating_add(1024),
         200_000,
     );
 
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
     ui::render::render_content_lines(
         &full_text,
         &buffer,
@@ -138,8 +136,10 @@ pub fn print_highlighted(path: &str) -> io::Result<()> {
         buffer.len(),
         &res.spans,
         None,
-    );
-    print!("{}", crate::r#struct::RESET);
+        &mut writer,
+    )?;
+    writer.write_all(RESET.as_bytes())?;
+    writer.flush()?;
     Ok(())
 }
 

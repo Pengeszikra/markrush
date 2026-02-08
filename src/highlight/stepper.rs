@@ -1,7 +1,9 @@
 use crate::highlight::span::{Span, StyleId};
-use crate::highlight::state::{PluginId, PrevClass, State};
+use crate::highlight::state::{PrevClass, State, PluginId};
 use crate::highlight::registry::Registry;
 use crate::highlight::spec::{Guard, StepAction, Trigger};
+use crate::highlight::spec::PluginSpec;
+use crate::highlight::js_lexer::{JsMode, lex_js_window, tokens_to_spans};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
@@ -22,11 +24,31 @@ pub struct Stepper<'a> {
     pub pos: usize,
     pub state: State,
     pub registry: &'a Registry,
+    plugin_cache: Vec<Option<PluginCache>>,
+}
+
+#[derive(Clone)]
+struct PluginCache {
+    op_buckets: Vec<Vec<&'static str>>,
+    punct_low_buckets: Vec<Vec<&'static str>>,
+    punct_mid_buckets: Vec<Vec<&'static str>>,
+    boundary_bytes: [bool; 256],
 }
 
 impl<'a> Stepper<'a> {
     pub fn new(src: &'a str, start_pos: usize, start_state: State, registry: &'a Registry) -> Self {
-        Self { src, pos: start_pos, state: start_state, registry }
+        Self { src, pos: start_pos, state: start_state, registry, plugin_cache: vec![None; plugin_count()] }
+    }
+
+    fn cache_for(&mut self, spec: &PluginSpec, plugin_id: PluginId) -> *const PluginCache {
+        let idx = plugin_index(plugin_id);
+        let slot: *mut Option<PluginCache> = &mut self.plugin_cache[idx];
+        unsafe {
+            if (*slot).is_none() || (*slot).as_ref().unwrap().op_buckets.len() != 256 {
+                *slot = Some(build_cache(spec));
+            }
+            (*slot).as_ref().unwrap() as *const PluginCache
+        }
     }
 
     pub fn step(&mut self, limit_pos: usize, max_bytes: usize, max_spans: usize) -> StepResult {
@@ -44,16 +66,53 @@ impl<'a> Stepper<'a> {
             let plugin_id = self.state.current();
             let spec = self.registry.by_id(plugin_id);
 
-            // 0) Continue an open comment/string (stateful, window-safe)
-            if let Some(span) = scan_stateful(self.src, self.pos, limit_pos, &mut self.state, plugin_id) {
-                self.pos = span.range.end;
-                spans.push(span);
-                // keep prev as Word-like to avoid accidental ExprStart triggers
-                self.state.prev = PrevClass::Word;
+            if plugin_id == PluginId::Js {
+                if let Some(scan) = spec.scan_custom {
+                    if let Some((span, action)) = scan(self.src, self.pos, limit_pos, &mut self.state) {
+                        self.pos = span.range.end;
+                        spans.push(span);
+                        apply_action(&mut self.state, action);
+                        continue;
+                    }
+                }
+                let (tokens, mode_out) = lex_js_window(self.src, self.pos, limit_pos, self.state.js_mode);
+                let js_spans = tokens_to_spans(&tokens, self.src);
+                for sp in js_spans {
+                    if spans.len() >= max_spans || (sp.range.end - start_pos) >= max_bytes {
+                        return StepResult { spans, stop: StopReason::BudgetExhausted, pos: self.pos, state: self.state.clone() };
+                    }
+                    spans.push(sp.clone());
+                }
+                if let Some(last) = tokens.last() {
+                    self.pos = last.end;
+                    self.state.prev = match last.kind {
+                        crate::highlight::js_lexer::JsTokenKind::Whitespace => PrevClass::Space,
+                        crate::highlight::js_lexer::JsTokenKind::Comment => PrevClass::Space,
+                        crate::highlight::js_lexer::JsTokenKind::Symbol => PrevClass::Operator,
+                        _ => PrevClass::Word,
+                    };
+                } else {
+                    self.pos = limit_pos;
+                }
+                self.state.js_mode = mode_out;
                 continue;
             }
 
-            // 1) Entry rules (push embedded languages)
+            let cache_ptr = self.cache_for(spec, plugin_id);
+            let cache = unsafe { &*cache_ptr };
+
+            // HTML comments in text mode
+            if plugin_id == PluginId::HtmlText && self.src[self.pos..].starts_with("<!--") {
+                let end_rel = self.src[self.pos..limit_pos].find("-->").map(|i| i + 3).unwrap_or(limit_pos - self.pos);
+                let end = self.pos + end_rel;
+                let span = Span { range: self.pos..end, style: StyleId::Comment };
+                self.pos = end;
+                spans.push(span);
+                self.state.prev = PrevClass::Space;
+                continue;
+            }
+
+            // Entry rules (push embedded languages)
             if let Some((span, action)) = try_entry_rules(spec.entry_rules, spec.entry_style, self.src, self.pos, &self.state) {
                 self.pos = span.range.end;
                 spans.push(span);
@@ -63,12 +122,12 @@ impl<'a> Stepper<'a> {
 
             // 2) Plugin custom scanner (may push/pop)
             if let Some(scan) = spec.scan_custom {
-                if let Some((span, action)) = scan(self.src, self.pos, &mut self.state) {
-                    self.pos = span.range.end;
-                    spans.push(span);
-                    apply_action(&mut self.state, action);
-                    continue;
-                }
+            if let Some((span, action)) = scan(self.src, self.pos, limit_pos, &mut self.state) {
+                self.pos = span.range.end;
+                spans.push(span);
+                apply_action(&mut self.state, action);
+                continue;
+            }
             }
 
             // 3) Whitespace
@@ -87,30 +146,35 @@ impl<'a> Stepper<'a> {
                 continue;
             }
 
-            // 5) Operators (longest match!)
-            if let Some(span) = scan_longest(self.src, self.pos, spec.operators, StyleId::Operator) {
+            if let Some(mut span) = scan_ident_or_keyword(self.src, self.pos, spec.keywords) {
+                if plugin_id == PluginId::Rust {
+                    if let Some(b'!') = self.src.as_bytes().get(span.range.end) {
+                        if self.src.as_bytes().get(span.range.end + 1) != Some(&b'=') {
+                            span.style = StyleId::Keyword;
+                        }
+                    }
+                }
                 self.pos = span.range.end;
                 spans.push(span);
                 self.state.prev = PrevClass::Operator;
                 continue;
             }
 
-            // 6) Punctuation
-            if let Some(span) = scan_longest(self.src, self.pos, spec.punct_mid, StyleId::PunctMid) {
-                self.pos = span.range.end;
-                spans.push(span);
-                self.state.prev = PrevClass::Punct;
-                continue;
-            }
-            if let Some(span) = scan_longest(self.src, self.pos, spec.punct_low, StyleId::PunctLow) {
+            if let Some(span) = scan_longest_bucketed(self.src, self.pos, &cache.op_buckets, StyleId::Operator) {
                 self.pos = span.range.end;
                 spans.push(span);
                 self.state.prev = PrevClass::Punct;
                 continue;
             }
 
-            // 7) Numbers
-            if let Some(span) = scan_number(self.src, self.pos) {
+            if let Some(span) = scan_longest_bucketed(self.src, self.pos, &cache.punct_low_buckets, StyleId::PunctLow) {
+                self.pos = span.range.end;
+                spans.push(span);
+                self.state.prev = PrevClass::Punct;
+                continue;
+            }
+
+            if let Some(span) = scan_longest_bucketed(self.src, self.pos, &cache.punct_mid_buckets, StyleId::PunctMid) {
                 self.pos = span.range.end;
                 spans.push(span);
                 self.state.prev = PrevClass::Word;
@@ -125,8 +189,8 @@ impl<'a> Stepper<'a> {
                 continue;
             }
 
-            // 9) Fallback: consume one UTF-8 char
-            let end = next_char_boundary(self.src, self.pos).unwrap_or(self.src.len());
+            // Fallback: consume a run of plain text to reduce span count.
+            let end = consume_plain_run(self.src, self.pos, limit_pos, &cache.boundary_bytes);
             spans.push(Span { range: self.pos..end, style: StyleId::Text });
             self.pos = end;
             self.state.prev = PrevClass::Word;
@@ -221,10 +285,43 @@ fn scan_ident_or_keyword(src: &str, pos: usize, keywords: &[&str], plugin: Plugi
     Some(Span { range: pos..end, style: if is_kw { StyleId::Keyword } else { ident_style } })
 }
 
-fn scan_longest(src: &str, pos: usize, list: &[&str], style: StyleId) -> Option<Span> {
-    if pos >= src.len() { return None; }
-    let mut best: Option<&str> = None;
+fn build_buckets(list: &[&'static str]) -> Vec<Vec<&'static str>> {
+    let mut buckets: Vec<Vec<&'static str>> = vec![Vec::new(); 256];
     for pat in list {
+        if let Some(&b) = pat.as_bytes().get(0) {
+            buckets[b as usize].push(*pat);
+        }
+    }
+    for bucket in buckets.iter_mut() {
+        bucket.sort_by(|a, b| b.len().cmp(&a.len()));
+    }
+    buckets
+}
+
+fn build_boundary_bytes(spec: &PluginSpec) -> [bool; 256] {
+    let mut b = [false; 256];
+    for pat in spec.operators.iter().chain(spec.punct_low.iter()).chain(spec.punct_mid.iter()) {
+        if let Some(&byte) = pat.as_bytes().get(0) {
+            b[byte as usize] = true;
+        }
+    }
+    b[b'\'' as usize] = true;
+    b[b'"' as usize] = true;
+    b[b'`' as usize] = true;
+    b[b'/' as usize] = true;
+    b
+}
+
+fn scan_longest_bucketed(src: &str, pos: usize, buckets: &[Vec<&'static str>], style: StyleId) -> Option<Span> {
+    if pos >= src.len() {
+        return None;
+    }
+    let b = src.as_bytes()[pos];
+    let bucket = &buckets[b as usize];
+    if bucket.is_empty() {
+        return None;
+    }
+    for pat in bucket {
         if src[pos..].starts_with(pat) {
             best = match best {
                 None => Some(*pat),
@@ -283,71 +380,50 @@ fn scan_stateful(src: &str, pos: usize, limit_pos: usize, state: &mut State, plu
     None
 }
 
-fn scan_comment_or_string_start(src: &str, pos: usize, limit_pos: usize, state: &mut State, plugin: PluginId) -> Option<Span> {
-    let search_end = limit_pos.min(src.len());
-
-    // JS / Rust: // line comment
-    if matches!(plugin, PluginId::Js | PluginId::Rust) && src[pos..].starts_with("//") {
-        let line_end = src[pos..search_end].find('\n').map(|n| pos + n).unwrap_or(search_end);
-        return Some(Span { range: pos..line_end, style: StyleId::Comment });
-    }
-
-    // Bash: # line comment
-    if matches!(plugin, PluginId::Bash) && src.as_bytes().get(pos).copied() == Some(b'#') {
-        let line_end = src[pos..search_end].find('\n').map(|n| pos + n).unwrap_or(search_end);
-        return Some(Span { range: pos..line_end, style: StyleId::Comment });
-    }
-
-    // JS / Rust: /* block comment */
-    if matches!(plugin, PluginId::Js | PluginId::Rust) && src[pos..].starts_with("/*") {
-        if let Some(rel) = src[pos..search_end].find("*/") {
-            let end = (pos + rel + 2).min(search_end);
-            return Some(Span { range: pos..end, style: StyleId::Comment });
-        }
-        state.in_block_comment = true;
-        return Some(Span { range: pos..search_end, style: StyleId::Comment });
-    }
-
-    // Strings:
-    // - JS: ', ", `
-    // - Rust: ", ' (char treated as string-ish here)
-    // - HTML tag: quoted attribute values
-    let b = src.as_bytes().get(pos).copied()?;
-    let is_string_start = match plugin {
-        PluginId::Js => matches!(b, b'\'' | b'"' | b'`'),
-        PluginId::Rust => matches!(b, b'\'' | b'"'),
-        PluginId::HtmlTag => matches!(b, b'\'' | b'"'),
-        _ => false,
-    };
-    if !is_string_start { return None; }
-
-    let delim = b;
-    let mut i = pos + 1;
+fn consume_plain_run(src: &str, pos: usize, limit_pos: usize, boundary: &[bool; 256]) -> usize {
     let bytes = src.as_bytes();
-    while i < search_end {
-        let bb = bytes[i];
-        if bb == b'\\' {
-            i = (i + 2).min(search_end);
-            continue;
+    let mut i = pos;
+    while i < limit_pos {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() || boundary[b as usize] {
+            break;
         }
-        if bb == delim {
-            let end = (i + 1).min(search_end);
-            let style = match plugin {
-                PluginId::HtmlTag => StyleId::AttrValue,
-                _ => StyleId::String,
-            };
-            return Some(Span { range: pos..end, style });
-        }
-        i += 1;
+        let step = if b < 0x80 {
+            1
+        } else {
+            src[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+        };
+        i = i.saturating_add(step).min(limit_pos);
     }
+    if i == pos {
+        next_char_boundary(src, pos).unwrap_or(src.len()).min(limit_pos)
+    } else {
+        i
+    }
+}
 
-    // not closed
-    state.in_string_delim = Some(delim);
-    let style = match plugin {
-        PluginId::HtmlTag => StyleId::AttrValue,
-        _ => StyleId::String,
-    };
-    Some(Span { range: pos..search_end, style })
+fn build_cache(spec: &PluginSpec) -> PluginCache {
+    PluginCache {
+        op_buckets: build_buckets(spec.operators),
+        punct_low_buckets: build_buckets(spec.punct_low),
+        punct_mid_buckets: build_buckets(spec.punct_mid),
+        boundary_bytes: build_boundary_bytes(spec),
+    }
+}
+
+fn plugin_index(id: PluginId) -> usize {
+    match id {
+        PluginId::Markdown => 0,
+        PluginId::Js => 1,
+        PluginId::HtmlText => 2,
+        PluginId::HtmlTag => 3,
+        PluginId::Bash => 4,
+        PluginId::Rust => 5,
+    }
+}
+
+fn plugin_count() -> usize {
+    6
 }
 
 fn next_char_boundary(src: &str, pos: usize) -> Option<usize> {
@@ -363,4 +439,3 @@ fn is_line_start(src: &str, pos: usize) -> bool {
 fn contains_newline(src: &str, range: &core::ops::Range<usize>) -> bool {
     src[range.clone()].as_bytes().iter().any(|&b| b == b'\n')
 }
-

@@ -65,7 +65,7 @@ mod tests {
     use crate::highlight::spec::{Guard, StepAction, Trigger};
     use crate::highlight::state::{PluginId, State};
 
-    fn dummy_scan(_src: &str, _pos: usize, _state: &mut State) -> Option<(Span, StepAction)> {
+    fn dummy_scan(_src: &str, _pos: usize, _limit: usize, _state: &mut State) -> Option<(Span, StepAction)> {
         None
     }
 

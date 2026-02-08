@@ -9,10 +9,14 @@ fn is_line_start(src: &str, pos: usize) -> bool {
     pos == 0 || src.as_bytes().get(pos.wrapping_sub(1)).copied() == Some(b'\n')
 }
 
-pub fn scan_html_text_custom(src: &str, pos: usize, _state: &mut State) -> Option<(Span, StepAction)> {
+pub fn scan_html_text_custom(src: &str, pos: usize, _limit: usize, _state: &mut State) -> Option<(Span, StepAction)> {
     if is_line_start(src, pos) && src[pos..].starts_with("```") {
         let line_end = src[pos..].find('\n').map(|n| pos + n).unwrap_or(src.len());
         return Some((Span { range: pos..line_end, style: StyleId::MdFence }, StepAction::Pop));
+    }
+    if src[pos..].starts_with("<!--") {
+        let end = src[pos..].find("-->").map(|n| pos + n + 3).unwrap_or(src.len());
+        return Some((Span { range: pos..end, style: StyleId::Comment }, StepAction::None));
     }
     if src[pos..].starts_with('<') {
         return Some((Span { range: pos..(pos + 1), style: StyleId::Tag }, StepAction::Push(PluginId::HtmlTag)));
@@ -20,7 +24,7 @@ pub fn scan_html_text_custom(src: &str, pos: usize, _state: &mut State) -> Optio
     None
 }
 
-pub fn scan_html_tag_custom(src: &str, pos: usize, _state: &mut State) -> Option<(Span, StepAction)> {
+pub fn scan_html_tag_custom(src: &str, pos: usize, _limit: usize, _state: &mut State) -> Option<(Span, StepAction)> {
     if is_line_start(src, pos) && src[pos..].starts_with("```") {
         let line_end = src[pos..].find('\n').map(|n| pos + n).unwrap_or(src.len());
         return Some((Span { range: pos..line_end, style: StyleId::MdFence }, StepAction::Pop));

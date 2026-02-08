@@ -175,7 +175,7 @@ impl Editor {
 
     pub fn render(&mut self) {
         self.refresh_terminal_rows();
-        print!("\x1b[2J\x1b[H"); // clear screen
+        print!("\x1b[2J\x1b[H");
 
         let content_rows = self.screen_rows.saturating_sub(1);
 
@@ -199,7 +199,8 @@ impl Editor {
             self.last_new_spans.clear();
         }
 
-        ui::render::render_content_lines(
+        let mut stdout = io::stdout();
+        let _ = ui::render::render_content_lines(
             &full_text,
             &self.buffer,
             &line_starts,
@@ -207,6 +208,7 @@ impl Editor {
             content_rows,
             &self.last_new_spans,
             selection_abs,
+            &mut stdout,
         );
 
         let mode_label = match self.mode {
@@ -563,7 +565,9 @@ impl Editor {
                         self.pending_g = false;
                         if !self.buffer.is_empty() {
                             self.row = self.row.saturating_sub(3);
-                            if self.row >= self.buffer.len() { self.row = self.buffer.len().saturating_sub(1); }
+                            if self.row >= self.buffer.len() {
+                                self.row = self.buffer.len().saturating_sub(1);
+                            }
                             self.col = self.col.min(self.buffer[self.row].len());
                         }
                         let max_scroll = max_scroll(self.buffer.len(), self.screen_rows);
@@ -637,12 +641,6 @@ impl Editor {
                     }
                     Key::Char(c) => {
                         self.command.push(c);
-                    }
-                    Key::LittleG => {
-                        self.command.push('g');
-                    }
-                    Key::G => {
-                        self.command.push('G');
                     }
                     _ => {}
                 }

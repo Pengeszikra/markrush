@@ -26,7 +26,7 @@ pub struct EntryRule {
     pub guard: Guard,
 }
 
-pub type ScanFn = fn(src: &str, pos: usize, state: &mut State) -> Option<(Span, StepAction)>;
+pub type ScanFn = fn(src: &str, pos: usize, limit_pos: usize, state: &mut State) -> Option<(Span, StepAction)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepAction {
