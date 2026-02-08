@@ -4,6 +4,7 @@ use crate::highlight::span::Span;
 use crate::highlight::state::{State, PluginId};
 use crate::highlight::registry::Registry;
 use crate::highlight::stepper::{Stepper, StopReason};
+use std::env;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowReq {
@@ -33,15 +34,17 @@ pub struct HighlighterEngine<'a> {
     pub checkpoints: Vec<Checkpoint>,
     pub work_queue: Vec<WorkItem>,
     pub revision: u64,
+    pub debug_log: bool,
 }
 
 impl<'a> HighlighterEngine<'a> {
     pub fn new(registry: &'a Registry, root_plugin: crate::highlight::state::PluginId) -> Self {
-        Self { registry, root_plugin, checkpoints: Vec::new(), work_queue: Vec::new(), revision: 0 }
+        let debug_log = env::var("MD_RUSH_HIGHLIGHT_DEBUG").is_ok();
+        Self { registry, root_plugin, checkpoints: Vec::new(), work_queue: Vec::new(), revision: 0, debug_log }
     }
 
     pub fn highlight_window(&mut self, src: &str, window: WindowReq, budget_bytes: usize, budget_spans: usize) -> WindowResult {
-        let (anchor_offset, anchor_state, exact) = match self.find_anchor(window.start) {
+        let (anchor_offset, anchor_state, anchor_exact) = match self.find_anchor(window.start) {
             Some((off, st)) => (off, st, true),
             None => (0usize, State::new_with_root(self.root_plugin), false),
         };
@@ -74,7 +77,49 @@ impl<'a> HighlighterEngine<'a> {
             }
         }
 
-        WindowResult { spans: out, quality_exact: exact }
+        WindowResult { spans: out, quality_exact: anchor_exact }
+    }
+
+    pub fn highlight_window_full(&mut self, src: &str, window: WindowReq, budget_bytes: usize, budget_spans: usize) -> WindowResult {
+        let (anchor_offset, anchor_state, anchor_exact) = match self.find_anchor(window.start) {
+            Some((off, st)) => (off, st, true),
+            None => (0usize, State::new_with_root(self.root_plugin), false),
+        };
+
+        let limit = window.end.min(src.len());
+        let mut stepper = Stepper::new(src, anchor_offset, anchor_state, self.registry);
+
+        let mut out: Vec<Span> = Vec::new();
+        let mut exhausted = false;
+        let quality_exact = anchor_exact || anchor_offset == 0;
+
+        while stepper.pos < limit {
+            let before = stepper.pos;
+            let res = stepper.step(limit, budget_bytes, budget_spans);
+
+            for s in res.spans {
+                if s.range.end <= window.start { continue; }
+                if s.range.start >= window.end { break; }
+                out.push(s);
+            }
+
+            match res.stop {
+                StopReason::EndOfInput | StopReason::ReachedLimit => break,
+                StopReason::BudgetExhausted => {
+                    exhausted = true;
+                    if res.pos == before {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if self.debug_log {
+            eprintln!("highlight debug: spans={} exhausted={}", out.len(), exhausted);
+        }
+
+        WindowResult { spans: out, quality_exact: quality_exact && !exhausted }
     }
 
     pub fn schedule_checkpoint_build(&mut self, from_offset: usize, to_offset: usize) {
@@ -204,5 +249,37 @@ mod tests {
         assert!(engine.checkpoints.is_empty());
         assert!(engine.work_queue.is_empty());
         assert_eq!(engine.revision, 42);
+    }
+
+    #[test]
+    fn highlight_large_js_completes() {
+        let mut engine = HighlighterEngine::new(&REGISTRY, PluginId::Js);
+        let mut src = String::new();
+        for i in 0..1_000 {
+            src.push_str(&format!("const v{i} = foo(i) + bar[i]; // trailing comment\n"));
+        }
+        let res = engine.highlight_window_full(
+            &src,
+            WindowReq { start: 0, end: src.len() },
+            256 * 1024,
+            200_000,
+        );
+        assert!(res.spans.len() < 100_000);
+    }
+
+    #[test]
+    fn long_string_literal_is_single_span() {
+        let mut engine = HighlighterEngine::new(&REGISTRY, PluginId::Js);
+        let src = "\"hello \\\"world\\\" with escapes\";";
+        let res = engine.highlight_window_full(
+            src,
+            WindowReq { start: 0, end: src.len() },
+            8 * 1024,
+            10_000,
+        );
+        let string_spans: Vec<_> = res.spans.iter().filter(|s| s.style == crate::highlight::span::StyleId::String).collect();
+        assert_eq!(string_spans.len(), 1);
+        let semi = src.find(';').unwrap_or(src.len());
+        assert_eq!(string_spans[0].range.end, semi);
     }
 }

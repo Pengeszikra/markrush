@@ -1,3 +1,6 @@
+use std::io::{self, Write};
+use std::ops::Range;
+
 use crate::highlight::{Span, StyleId};
 
 const HEADER_COLOR: &str = "\u{1b}[1;36m"; // bright cyan for headings
@@ -40,59 +43,13 @@ pub fn style_color(style: StyleId) -> Option<&'static str> {
     }
 }
 
-pub fn render_segment(
-    full_text: &str,
-    start: usize,
-    end: usize,
-    base_color: Option<&str>,
-    selection_abs: Option<(usize, usize)>,
-) -> String {
-    if start >= end || start >= full_text.len() {
-        return String::new();
-    }
-
-    let end = end.min(full_text.len());
-
-    if let Some((sel_start, sel_end)) = selection_abs {
-        if sel_end <= start || sel_start >= end {
-            let mut out = color_links(&full_text[start..end], base_color);
-            out.push_str(RESET);
-            return out;
-        }
-
-        let sel_s = sel_start.max(start);
-        let sel_e = sel_end.min(end);
-
-        let mut out = String::new();
-        if start < sel_s {
-            out.push_str(&color_links(&full_text[start..sel_s], base_color));
-            out.push_str(RESET);
-        }
-
-        out.push_str(SEL_BG);
-        if let Some(color) = base_color {
-            out.push_str(color);
-        }
-        out.push_str(&full_text[sel_s..sel_e]);
-        out.push_str(RESET);
-
-        if sel_e < end {
-            out.push_str(&color_links(&full_text[sel_e..end], base_color));
-            out.push_str(RESET);
-        }
-        return out;
-    }
-
-    let mut out = color_links(&full_text[start..end], base_color);
-    out.push_str(RESET);
-    out
+fn is_markdown_style(style: StyleId) -> bool {
+    matches!(style, StyleId::MdHeading | StyleId::MdFence | StyleId::MdCodeSpan)
 }
 
-pub fn color_links(line: &str, base_color: Option<&str>) -> String {
+fn color_links_into(out: &mut String, line: &str, base_color: Option<&str>) {
     // Very small Markdown link highlighter: [text](url)
-    // Color the whole [..](..) segment.
     let bytes = line.as_bytes();
-    let mut out = String::new();
     let mut idx = 0usize;
 
     if let Some(color) = base_color {
@@ -110,7 +67,6 @@ pub fn color_links(line: &str, base_color: Option<&str>) -> String {
         if let Some(rel_mid) = line[start..].find("](") {
             let mid = start + rel_mid;
 
-            // Find ')'
             if let Some(rel_end) = line[mid + 2..].find(')') {
                 let end = mid + 2 + rel_end;
 
@@ -138,11 +94,68 @@ pub fn color_links(line: &str, base_color: Option<&str>) -> String {
     if idx < bytes.len() {
         out.push_str(&line[idx..]);
     }
-
-    out
 }
 
-pub fn render_content_lines(
+fn render_segment_into(
+    out: &mut String,
+    full_text: &str,
+    range: Range<usize>,
+    style: StyleId,
+    selection_abs: Option<(usize, usize)>,
+) {
+    let start = range.start;
+    let mut end = range.end;
+    if start >= end || start >= full_text.len() {
+        return;
+    }
+    end = end.min(full_text.len());
+
+    let base_color = style_color(style);
+    let use_links = is_markdown_style(style);
+
+    let write_plain = |out: &mut String, s: usize, e: usize| {
+        if s >= e {
+            return;
+        }
+        let slice = &full_text[s..e];
+        if use_links {
+            color_links_into(out, slice, base_color);
+        } else {
+            if let Some(color) = base_color {
+                out.push_str(color);
+            }
+            out.push_str(slice);
+        }
+        out.push_str(RESET);
+    };
+
+    if let Some((sel_start, sel_end)) = selection_abs {
+        if sel_end > start && sel_start < end {
+            let sel_s = sel_start.max(start);
+            let sel_e = sel_end.min(end);
+
+            if start < sel_s {
+                write_plain(out, start, sel_s);
+            }
+
+            out.push_str(SEL_BG);
+            if let Some(color) = base_color {
+                out.push_str(color);
+            }
+            out.push_str(&full_text[sel_s..sel_e]);
+            out.push_str(RESET);
+
+            if sel_e < end {
+                write_plain(out, sel_e, end);
+            }
+            return;
+        }
+    }
+
+    write_plain(out, start, end);
+}
+
+pub fn render_content_lines<W: Write>(
     full_text: &str,
     buffer: &[String],
     line_starts: &[usize],
@@ -150,15 +163,17 @@ pub fn render_content_lines(
     content_rows: usize,
     spans: &[Span],
     selection_abs: Option<(usize, usize)>,
-) {
+    mut out: W,
+) -> io::Result<()> {
     let merged_spans = merge_adjacent_spans(spans);
     let spans = merged_spans.as_slice();
     let mut span_idx = 0usize;
+    let mut line_out = String::new();
 
     for row in 0..content_rows {
         let line_idx = scroll + row;
         if line_idx >= buffer.len() {
-            println!();
+            out.write_all(b"\r\n")?;
             continue;
         }
 
@@ -169,7 +184,7 @@ pub fn render_content_lines(
             span_idx += 1;
         }
 
-        let mut line_out = String::new();
+        line_out.clear();
         let mut pos = line_start;
         let mut local_idx = span_idx;
 
@@ -183,16 +198,16 @@ pub fn render_content_lines(
             let seg_end = sp.range.end.min(line_end);
 
             if pos < seg_start {
-                line_out.push_str(&render_segment(full_text, pos, seg_start, None, selection_abs));
+                render_segment_into(&mut line_out, full_text, pos..seg_start, StyleId::Text, selection_abs);
             }
 
-            line_out.push_str(&render_segment(
+            render_segment_into(
+                &mut line_out,
                 full_text,
-                seg_start,
-                seg_end,
-                style_color(sp.style),
+                seg_start..seg_end,
+                sp.style,
                 selection_abs,
-            ));
+            );
 
             pos = seg_end;
 
@@ -203,14 +218,17 @@ pub fn render_content_lines(
         }
 
         if pos < line_end {
-            line_out.push_str(&render_segment(full_text, pos, line_end, None, selection_abs));
+            render_segment_into(&mut line_out, full_text, pos..line_end, StyleId::Text, selection_abs);
         }
 
         line_out.push_str(RESET);
-        print!("{line_out}\r\n");
+        line_out.push_str("\r\n");
+        out.write_all(line_out.as_bytes())?;
 
         span_idx = local_idx;
     }
+
+    Ok(())
 }
 
 fn merge_adjacent_spans(spans: &[Span]) -> Vec<Span> {
@@ -228,4 +246,43 @@ fn merge_adjacent_spans(spans: &[Span]) -> Vec<Span> {
         out.push(sp.clone());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_large_buffer_is_fast_path() {
+        let line_count = 10_000;
+        let mut buffer = Vec::with_capacity(line_count);
+        for i in 0..line_count {
+            buffer.push(format!("line {i} content"));
+        }
+        let full_text = buffer.join("\n");
+        let mut starts = Vec::with_capacity(buffer.len());
+        let mut offset = 0usize;
+        for (i, line) in buffer.iter().enumerate() {
+            starts.push(offset);
+            offset += line.len();
+            if i + 1 < buffer.len() {
+                offset += 1;
+            }
+        }
+
+        let mut out = Vec::new();
+        render_content_lines(
+            &full_text,
+            &buffer,
+            &starts,
+            0,
+            buffer.len(),
+            &[],
+            None,
+            &mut out,
+        )
+        .expect("render should succeed");
+
+        assert!(!out.is_empty());
+    }
 }

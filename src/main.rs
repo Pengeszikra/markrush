@@ -8,10 +8,11 @@ use crate::highlight::{HighlighterEngine, REGISTRY as NEW_REGISTRY, WindowReq, P
 use std::{
     env,
     fs,
-    io::{self, Read, StdinLock, Write},
+    io::{self, BufWriter, Read, StdinLock, Write},
     process::{self, Command, Stdio},
     path::Path,
     str,
+    time::Instant,
 };
 
 const RESET: &str = "\u{1b}[0m";
@@ -117,6 +118,7 @@ struct CliConfig {
     print_mode: bool,
     help: bool,
     copy_mode: bool,
+    time_mode: bool,
 }
 
 struct Editor {
@@ -359,7 +361,8 @@ impl Editor {
 
         self.update_highlighting(&full_text, &line_starts, content_rows);
 
-        ui::render::render_content_lines(
+        let mut stdout = io::stdout();
+        let _ = ui::render::render_content_lines(
             &full_text,
             &self.buffer,
             &line_starts,
@@ -367,6 +370,7 @@ impl Editor {
             content_rows,
             &self.last_new_spans,
             selection_abs,
+            &mut stdout,
         );
 
         let mode_label = match self.mode {
@@ -923,12 +927,13 @@ fn read_key(stdin: &mut StdinLock<'_>) -> Key {
 }
 
 fn parse_args<I: Iterator<Item = String>>(args: I) -> CliConfig {
-    let mut cfg = CliConfig { file: None, print_mode: false, help: false, copy_mode: false };
+    let mut cfg = CliConfig { file: None, print_mode: false, help: false, copy_mode: false, time_mode: false };
     for arg in args {
         match arg.as_str() {
             "-p" | "--print" => cfg.print_mode = true,
             "-h" | "--help" | "-?" => cfg.help = true,
             "-c" | "--copy" => cfg.copy_mode = true,
+            "-t" | "--time" => cfg.time_mode = true,
             _ if arg.starts_with('-') => {
                 eprintln!("Unknown flag: {arg}");
             }
@@ -944,7 +949,8 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> CliConfig {
     cfg
 }
 
-fn print_highlighted(path: &str) -> io::Result<()> {
+fn print_highlighted(path: &str, log_time: bool) -> io::Result<()> {
+    let t_read_start = Instant::now();
     if !Path::new(path).exists() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
     }
@@ -958,18 +964,25 @@ fn print_highlighted(path: &str) -> io::Result<()> {
         buffer.push(String::new());
     }
 
+    let t_read = t_read_start.elapsed();
+
     let full_text = buffer.join("\n");
     let line_starts = compute_line_starts(&buffer);
 
     let base_plugin = select_plugin_for_path(path);
     let mut engine = HighlighterEngine::new(&NEW_REGISTRY, base_plugin);
-    let res = engine.highlight_window(
+    let t_highlight_start = Instant::now();
+    let res = engine.highlight_window_full(
         &full_text,
         WindowReq { start: 0, end: full_text.len() },
         full_text.len().saturating_add(1024),
         200_000,
     );
+    let t_highlight = t_highlight_start.elapsed();
 
+    let t_render_start = Instant::now();
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
     ui::render::render_content_lines(
         &full_text,
         &buffer,
@@ -978,8 +991,20 @@ fn print_highlighted(path: &str) -> io::Result<()> {
         buffer.len(),
         &res.spans,
         None,
-    );
-    print!("{RESET}");
+        &mut writer,
+    )?;
+    writer.write_all(RESET.as_bytes())?;
+    writer.flush()?;
+    let t_render = t_render_start.elapsed();
+    if log_time {
+        eprintln!(
+            "time read={}ms highlight={}ms render={}ms lines={}",
+            t_read.as_millis(),
+            t_highlight.as_millis(),
+            t_render.as_millis(),
+            buffer.len()
+        );
+    }
     Ok(())
 }
 
@@ -997,7 +1022,7 @@ fn copy_file_and_preview(path: &str) -> io::Result<()> {
 fn main() {
     let config = parse_args(env::args().skip(1));
     if config.help {
-        if let Err(e) = print_highlighted("HELP.md") {
+        if let Err(e) = print_highlighted("HELP.md", config.time_mode) {
             eprintln!("Failed to show help: {e}");
         }
         return;
@@ -1007,9 +1032,15 @@ fn main() {
             eprintln!("No file provided for --copy");
             process::exit(1);
         };
-        if let Err(e) = copy_file_and_preview(path) {
+        let start = Instant::now();
+        let res = copy_file_and_preview(path);
+        let elapsed = start.elapsed().as_millis();
+        if let Err(e) = res {
             eprintln!("Failed to copy file: {e}");
             process::exit(1);
+        }
+        if config.time_mode {
+            eprintln!("elapsed: {}ms", elapsed);
         }
         return;
     }
@@ -1018,9 +1049,15 @@ fn main() {
             eprintln!("No file provided for --print");
             process::exit(1);
         };
-        if let Err(e) = print_highlighted(path) {
+        let start = Instant::now();
+        let res = print_highlighted(path, config.time_mode);
+        let elapsed = start.elapsed().as_millis();
+        if let Err(e) = res {
             eprintln!("Failed to print file: {e}");
             process::exit(1);
+        }
+        if config.time_mode {
+            eprintln!("elapsed: {}ms", elapsed);
         }
         return;
     }

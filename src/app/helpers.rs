@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -119,13 +119,15 @@ pub fn print_highlighted(path: &str) -> io::Result<()> {
 
     let base_plugin = select_plugin_for_path(path);
     let mut engine = HighlighterEngine::new(&NEW_REGISTRY, base_plugin);
-    let res = engine.highlight_window(
+    let res = engine.highlight_window_full(
         &full_text,
         WindowReq { start: 0, end: full_text.len() },
         full_text.len().saturating_add(1024),
         200_000,
     );
 
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
     ui::render::render_content_lines(
         &full_text,
         &buffer,
@@ -134,8 +136,10 @@ pub fn print_highlighted(path: &str) -> io::Result<()> {
         buffer.len(),
         &res.spans,
         None,
-    );
-    print!("{RESET}");
+        &mut writer,
+    )?;
+    writer.write_all(RESET.as_bytes())?;
+    writer.flush()?;
     Ok(())
 }
 

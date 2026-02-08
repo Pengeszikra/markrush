@@ -199,7 +199,8 @@ impl Editor {
             self.last_new_spans.clear();
         }
 
-        ui::render::render_content_lines(
+        let mut stdout = io::stdout();
+        let _ = ui::render::render_content_lines(
             &full_text,
             &self.buffer,
             &line_starts,
@@ -207,6 +208,7 @@ impl Editor {
             content_rows,
             &self.last_new_spans,
             selection_abs,
+            &mut stdout,
         );
 
         let mode_label = match self.mode {

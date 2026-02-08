@@ -17,7 +17,7 @@ fn next_char_boundary(src: &str, pos: usize) -> Option<usize> {
     Some(pos + ch.len_utf8())
 }
 
-pub fn scan_markdown_custom(src: &str, pos: usize, _state: &mut State) -> Option<(Span, StepAction)> {
+pub fn scan_markdown_custom(src: &str, pos: usize, _limit: usize, _state: &mut State) -> Option<(Span, StepAction)> {
     // Heading: line-start '#'
     if is_line_start(src, pos) && src[pos..].starts_with('#') {
         let line_end = src[pos..].find('\n').map(|n| pos + n).unwrap_or(src.len());
