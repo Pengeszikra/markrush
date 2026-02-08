@@ -120,7 +120,7 @@ impl<'a> Stepper<'a> {
                 continue;
             }
 
-            // Plugin custom scanner
+            // 2) Plugin custom scanner (may push/pop)
             if let Some(scan) = spec.scan_custom {
             if let Some((span, action)) = scan(self.src, self.pos, limit_pos, &mut self.state) {
                 self.pos = span.range.end;
@@ -130,7 +130,7 @@ impl<'a> Stepper<'a> {
             }
             }
 
-            // Generic scanners
+            // 3) Whitespace
             if let Some(span) = scan_whitespace(self.src, self.pos) {
                 self.pos = span.range.end;
                 spans.push(span);
@@ -138,7 +138,8 @@ impl<'a> Stepper<'a> {
                 continue;
             }
 
-            if let Some(span) = scan_number(self.src, self.pos) {
+            // 4) Start comment/string (before operators/idents!)
+            if let Some(span) = scan_comment_or_string_start(self.src, self.pos, limit_pos, &mut self.state, plugin_id) {
                 self.pos = span.range.end;
                 spans.push(span);
                 self.state.prev = PrevClass::Word;
@@ -155,14 +156,14 @@ impl<'a> Stepper<'a> {
                 }
                 self.pos = span.range.end;
                 spans.push(span);
-                self.state.prev = PrevClass::Word;
+                self.state.prev = PrevClass::Operator;
                 continue;
             }
 
             if let Some(span) = scan_longest_bucketed(self.src, self.pos, &cache.op_buckets, StyleId::Operator) {
                 self.pos = span.range.end;
                 spans.push(span);
-                self.state.prev = PrevClass::Operator;
+                self.state.prev = PrevClass::Punct;
                 continue;
             }
 
@@ -176,7 +177,15 @@ impl<'a> Stepper<'a> {
             if let Some(span) = scan_longest_bucketed(self.src, self.pos, &cache.punct_mid_buckets, StyleId::PunctMid) {
                 self.pos = span.range.end;
                 spans.push(span);
-                self.state.prev = PrevClass::Punct;
+                self.state.prev = PrevClass::Word;
+                continue;
+            }
+
+            // 8) Ident / Keyword (HTML tag mode uses AttrName)
+            if let Some(span) = scan_ident_or_keyword(self.src, self.pos, spec.keywords, plugin_id) {
+                self.pos = span.range.end;
+                spans.push(span);
+                self.state.prev = PrevClass::Word;
                 continue;
             }
 
@@ -256,7 +265,7 @@ fn scan_number(src: &str, pos: usize) -> Option<Span> {
     Some(Span { range: pos..i, style: StyleId::Number })
 }
 
-fn scan_ident_or_keyword(src: &str, pos: usize, keywords: &[&str]) -> Option<Span> {
+fn scan_ident_or_keyword(src: &str, pos: usize, keywords: &[&str], plugin: PluginId) -> Option<Span> {
     let mut it = src[pos..].char_indices();
     let (_, first) = it.next()?;
     if !(first == '_' || first.is_ascii_alphabetic()) { return None; }
@@ -267,7 +276,13 @@ fn scan_ident_or_keyword(src: &str, pos: usize, keywords: &[&str]) -> Option<Spa
     }
     let slice = &src[pos..end];
     let is_kw = keywords.iter().any(|&k| k == slice);
-    Some(Span { range: pos..end, style: if is_kw { StyleId::Keyword } else { StyleId::Ident } })
+
+    let ident_style = match plugin {
+        PluginId::HtmlTag => StyleId::AttrName,
+        _ => StyleId::Ident,
+    };
+
+    Some(Span { range: pos..end, style: if is_kw { StyleId::Keyword } else { ident_style } })
 }
 
 fn build_buckets(list: &[&'static str]) -> Vec<Vec<&'static str>> {
@@ -308,9 +323,60 @@ fn scan_longest_bucketed(src: &str, pos: usize, buckets: &[Vec<&'static str>], s
     }
     for pat in bucket {
         if src[pos..].starts_with(pat) {
-            return Some(Span { range: pos..(pos + pat.len()), style });
+            best = match best {
+                None => Some(*pat),
+                Some(prev) if pat.len() > prev.len() => Some(*pat),
+                _ => best,
+            };
         }
     }
+    best.map(|pat| Span { range: pos..(pos + pat.len()), style })
+}
+
+fn scan_stateful(src: &str, pos: usize, limit_pos: usize, state: &mut State, plugin: PluginId) -> Option<Span> {
+    // Block comment continuation
+    if state.in_block_comment {
+        let end_pat = "*/";
+        let search_end = limit_pos.min(src.len());
+        if let Some(rel) = src[pos..search_end].find(end_pat) {
+            let end = (pos + rel + end_pat.len()).min(search_end);
+            state.in_block_comment = false;
+            return Some(Span { range: pos..end, style: StyleId::Comment });
+        }
+        // not closed in this window
+        return Some(Span { range: pos..search_end, style: StyleId::Comment });
+    }
+
+    // String continuation
+    if let Some(delim) = state.in_string_delim {
+        let search_end = limit_pos.min(src.len());
+        let mut i = pos;
+        let bytes = src.as_bytes();
+        while i < search_end {
+            let b = bytes[i];
+            if b == b'\\' {
+                // skip escaped byte + next byte (best-effort; UTF-8 safe enough for typical code)
+                i = (i + 2).min(search_end);
+                continue;
+            }
+            if b == delim {
+                let end = (i + 1).min(search_end);
+                state.in_string_delim = None;
+                let style = match plugin {
+                    PluginId::HtmlTag => StyleId::AttrValue,
+                    _ => StyleId::String,
+                };
+                return Some(Span { range: pos..end, style });
+            }
+            i += 1;
+        }
+        let style = match plugin {
+            PluginId::HtmlTag => StyleId::AttrValue,
+            _ => StyleId::String,
+        };
+        return Some(Span { range: pos..search_end, style });
+    }
+
     None
 }
 

@@ -1,5 +1,8 @@
+// src/main.rs
+
 #[path = "highlight-core.rs"]
 mod highlight_core;
+
 mod highlight;
 mod ui;
 
@@ -675,26 +678,12 @@ fn max_scroll(buffer_len: usize, screen_rows: usize) -> usize {
     }
 }
 
-fn load_buffer(path: &str) -> Vec<String> {
-    let content = fs::read_to_string(path).unwrap_or_default();
-    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-    if content.ends_with('\n') {
-        lines.push(String::new());
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
+use std::{io, process};
 
-fn read_terminal_size() -> Option<(usize, usize)> {
-    // Try ioctl first for accurate size.
-    #[cfg(unix)]
-    {
-        if let Some(ws) = unix_winsize() {
-            return Some(ws);
-        }
-    }
+use app::arguments::parse_args;
+use app::helpers::{copy_file_and_preview, print_highlighted};
+use app::keyboard::read_key;
+use app::editor::Editor;
 
     // Fallback to `stty size`.
     if let Ok(out) = Command::new("stty").arg("size").output() {
@@ -1020,13 +1009,17 @@ fn copy_file_and_preview(path: &str) -> io::Result<()> {
 }
 
 fn main() {
-    let config = parse_args(env::args().skip(1));
+    let config = parse_args(std::env::args().skip(1));
+
+    // HELP uses your existing help renderer (it already highlights HELP.md)
     if config.help {
         if let Err(e) = print_highlighted("HELP.md", config.time_mode) {
             eprintln!("Failed to show help: {e}");
         }
         return;
     }
+
+    // Copy mode
     if config.copy_mode {
         let Some(path) = config.file.as_deref() else {
             eprintln!("No file provided for --copy");
@@ -1044,6 +1037,8 @@ fn main() {
         }
         return;
     }
+
+    // Print mode
     if config.print_mode {
         let Some(path) = config.file.as_deref() else {
             eprintln!("No file provided for --print");
@@ -1062,8 +1057,7 @@ fn main() {
         return;
     }
 
-    let file = config.file;
-
+    // Interactive editor
     let _raw = match RawModeGuard::new() {
         Ok(g) => g,
         Err(e) => {
@@ -1072,13 +1066,14 @@ fn main() {
         }
     };
 
-    let screen_rows = read_terminal_size().map(|(r, _)| r).unwrap_or(24);
-    let mut editor = Editor::open(file.as_deref(), screen_rows);
+    let screen_rows = app::helpers::read_terminal_size()
+        .map(|(r, _)| r)
+        .unwrap_or(24);
+
+    let mut editor = Editor::open(config.file.as_deref(), screen_rows);
 
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
-
-    let mut needs_render = true;
 
     loop {
         let resized = editor.refresh_terminal_rows();
@@ -1296,6 +1291,5 @@ fn main() {
         }
     }
 
-    print!("{RESET}");
-    let _ = io::stdout().flush();
+    editor.finish();
 }

@@ -101,3 +101,4 @@ impl<T: Copy, const N: usize> SmallStack<T, N> {
     #[allow(dead_code)]
     pub fn has_overflowed(&self) -> bool { self.has_overflow }
 }
+
