@@ -2,6 +2,7 @@
 caro build under 2sec.
 
 ## fast JS lexer added
+Some problem maybe with merge
 
 ```html
 <div>hello</div>
